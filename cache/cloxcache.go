@@ -19,12 +19,6 @@ const (
 	// maxProbes is the maximum number of slots to check during admission
 	maxProbes = 8
 
-	// sweepInterval is the time between CLOCK sweeper ticks
-	sweepInterval = 10 * time.Millisecond
-
-	// slotsPerTick is how many slots to process per sweep tick (budgeted scanning)
-	slotsPerTick = 256
-
 	// decayInterval is how often to retarget the decay step
 	decayInterval = 1 * time.Second
 )
@@ -64,8 +58,10 @@ type CloxCache[K Key, V any] struct {
 
 // shard contains a portion of the cache slots with minimal lock contention
 type shard[K Key, V any] struct {
-	slots []atomic.Pointer[recordNode[K, V]]
-	mu    sync.Mutex // only for insertions and sweeper unlink
+	slots      []atomic.Pointer[recordNode[K, V]]
+	mu         sync.Mutex   // only for insertions and sweeper unlink
+	entryCount atomic.Int64 // entries in this shard
+	capacity   int64        // max entries for this shard
 }
 
 // recordNode is a cache entry with collision chaining
@@ -86,6 +82,7 @@ type recordNode[K Key, V any] struct {
 type Config struct {
 	NumShards     int  // Must be power of 2
 	SlotsPerShard int  // Must be power of 2
+	Capacity      int  // Max entries (0 = use SlotsPerShard * NumShards as default)
 	CollectStats  bool // Enable hit/miss/eviction counters (default: false for performance)
 	AdaptiveDecay bool // Enable adaptive decay tuning (implies CollectStats)
 }
@@ -119,18 +116,26 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 		collectStats: collectStats,
 	}
 
+	// Calculate per-shard capacity
+	totalCapacity := cfg.Capacity
+	if totalCapacity <= 0 {
+		totalCapacity = cfg.NumShards * cfg.SlotsPerShard
+	}
+	perShardCapacity := int64(totalCapacity / cfg.NumShards)
+	if perShardCapacity < 1 {
+		perShardCapacity = 1
+	}
+
 	// Initialize shards
 	for i := range c.shards {
 		c.shards[i].slots = make([]atomic.Pointer[recordNode[K, V]], cfg.SlotsPerShard)
+		c.shards[i].capacity = perShardCapacity
 	}
 
 	// Start with gentle decay
 	c.decayStep.Store(1)
 
-	// Start background goroutines
-	c.wg.Add(1)
-	go c.sweeper(cfg.SlotsPerShard, cfg.AdaptiveDecay)
-
+	// Start adaptive decay tuning if enabled
 	if cfg.AdaptiveDecay {
 		c.wg.Add(1)
 		go c.retargetDecayLoop()
@@ -287,12 +292,88 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 		node = node.next.Load()
 	}
 
+	// Evict from this shard if over capacity
+	for shard.entryCount.Load() >= shard.capacity {
+		evicted := c.evictFromShard(int(shardID), len(shard.slots))
+		if evicted == 0 {
+			// Couldn't evict anything, break to avoid infinite loop
+			return false
+		}
+	}
+
 	// Insert at head
 	head := slot.Load()
 	newNode.next.Store(head)
 	slot.Store(newNode)
+	shard.entryCount.Add(1)
 
 	return true
+}
+
+// evictFromShard sweeps a shard and evicts low-frequency entries.
+// Called during Put when shard is over capacity. Caller must hold shard lock.
+// Returns the number of entries evicted.
+//
+// Uses a two-pass approach:
+// 1. First pass: decay all frequencies
+// 2. Second pass: evict entries with freq == 0
+func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
+	shard := &c.shards[shardID]
+	dec := c.decayStep.Load()
+	if dec == 0 {
+		dec = 1
+	}
+
+	// First pass: decay all frequencies
+	for slotID := 0; slotID < slotsPerShard; slotID++ {
+		slot := &shard.slots[slotID]
+		for node := slot.Load(); node != nil; node = node.next.Load() {
+			f := node.freq.Load()
+			if f > dec {
+				node.freq.Store(f - dec)
+			} else if f > 0 {
+				node.freq.Store(0)
+			}
+		}
+	}
+
+	// Second pass: evict entries with freq == 0
+	evicted := 0
+	for slotID := 0; slotID < slotsPerShard; slotID++ {
+		slot := &shard.slots[slotID]
+		node := slot.Load()
+		var prev *recordNode[K, V]
+
+		for node != nil {
+			next := node.next.Load()
+
+			if node.freq.Load() == 0 {
+				if c.collectStats {
+					c.evictions.Add(1)
+				}
+				shard.entryCount.Add(-1)
+				evicted++
+
+				if prev == nil {
+					slot.Store(next)
+				} else {
+					prev.next.Store(next)
+				}
+				node = next
+				continue
+			}
+
+			prev = node
+			node = next
+		}
+
+		// Stop early if we've evicted enough
+		if shard.entryCount.Load() < shard.capacity {
+			break
+		}
+	}
+
+	return evicted
 }
 
 // shouldAdmit implements TinyLFU-style admission gate
@@ -327,100 +408,6 @@ func (c *CloxCache[K, V]) shouldAdmit() bool {
 
 	// All probed victims are hotter - reject
 	return false
-}
-
-// sweeper is the background CLOCK hand that ages and evicts entries
-func (c *CloxCache[K, V]) sweeper(slotsPerShard int, adaptiveDecay bool) {
-	defer c.wg.Done()
-	hand := uint64(0)
-	totalSlots := uint64(c.numShards * slotsPerShard)
-
-	ticker := time.NewTicker(sweepInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stop:
-			return
-		case <-ticker.C:
-			// Process a batch of slots
-			var dec uint32 = 1
-			if adaptiveDecay {
-				dec = c.decayStep.Load()
-			}
-
-			for range slotsPerTick {
-				slotIdx := hand % totalSlots
-				shardID := slotIdx % uint64(c.numShards)
-				localSlot := slotIdx / uint64(c.numShards)
-
-				if int(localSlot) >= slotsPerShard {
-					hand++
-					continue
-				}
-
-				c.sweepSlot(int(shardID), int(localSlot), dec)
-				hand++
-			}
-
-			// Update global hand
-			c.hand.Store(hand)
-		}
-	}
-}
-
-// sweepSlot processes a single slot's chain
-func (c *CloxCache[K, V]) sweepSlot(shardID, slotID int, dec uint32) {
-	shard := &c.shards[shardID]
-	slot := &shard.slots[slotID]
-
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	node := slot.Load()
-	var prev *recordNode[K, V]
-
-	for node != nil {
-		f := node.freq.Load()
-		if f > 0 {
-			// Age down
-			var newFreq uint32
-			if f > dec {
-				newFreq = f - dec
-			} else {
-				newFreq = 0
-			}
-			node.freq.Store(newFreq)
-
-			prev = node
-			node = node.next.Load()
-			continue
-		}
-
-		// Evict: freq == 0
-		if c.collectStats {
-			c.evictions.Add(1)
-		}
-
-		next := node.next.Load()
-		if prev == nil {
-			// Head removal
-			for !slot.CompareAndSwap(node, next) {
-				cur := slot.Load()
-				if cur != node {
-					// Head changed, restart
-					prev = nil
-					node = cur
-					goto continueBucket
-				}
-			}
-		} else {
-			// Middle removal
-			prev.next.Store(next)
-		}
-		node = next
-	continueBucket:
-	}
 }
 
 // retargetDecayLoop periodically adjusts the decay step based on metrics

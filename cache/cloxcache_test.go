@@ -66,15 +66,17 @@ func TestCloxCacheUpdate(t *testing.T) {
 }
 
 func TestCloxCacheConcurrentAccess(t *testing.T) {
+	const numGoroutines = 100
+	const numOps = 1000
+	totalKeys := numGoroutines * numOps // 100,000
+
 	cfg := Config{
 		NumShards:     64,
-		SlotsPerShard: 1024,
+		SlotsPerShard: 2048,
+		Capacity:      totalKeys, // Ensure capacity for all keys
 	}
 	cache := NewCloxCache[[]byte, int](cfg)
 	defer cache.Close()
-
-	const numGoroutines = 100
-	const numOps = 1000
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
