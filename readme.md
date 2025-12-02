@@ -1,130 +1,170 @@
-# CloxCache Configuration Guide
+# CloxCache
 
-CloxCache provides automatic hardware detection and dynamic configuration to optimize memory usage for your system.
+A high-performance, lock-free, adaptive in-memory LRU cache for Go.
+CloxCache combines CLOCK-Pro eviction with TinyLFU admission and optional adaptive frequency decay.
 
-## Configuration Options
+## Features
 
-### 1. Automatic Hardware Detection (Default)
+- **Lock-free reads**: Get operations are fully lock-free for maximum throughput
+- **Generic keys and values**: Supports `string` or `[]byte` keys with any value type
+- **Automatic hardware detection**: Configures itself based on CPU count and available memory
+- **Adaptive eviction**: Optional adaptive decay adjusts eviction aggressiveness based on workload
+- **Low overhead**: Minimal memory overhead with efficient bit-masking for shard routing
 
-By default, CloxCache automatically detects your system's hardware and configures itself:
+## Installation
 
-```caddyfile
-:443 {
-    atlas {
-          # ... other options ...
-          # No max_cache_size specified - auto-detect hardware
-          }
+```bash
+go get github.com/bottledcode/cloxcache
+```
+
+## Quick Start
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/bottledcode/cloxcache/cache"
+)
+
+func main() {
+	// Auto-detect hardware and configure cache
+	cfg := cache.ConfigFromHardware()
+	c := cache.NewCloxCache[string, *MyData](cfg)
+	defer c.Close()
+
+	// Store a value
+	c.Put("user:123", &MyData{Name: "Alice"})
+
+	// Retrieve a value
+	if data, ok := c.Get("user:123"); ok {
+		fmt.Println(data.Name)
+	}
+}
+
+type MyData struct {
+	Name string
+}
+```
+
+## Configuration
+
+### Automatic Hardware Detection (Recommended)
+
+```go
+cfg := cache.ConfigFromHardware()
+c := cache.NewCloxCache[string, *MyValue](cfg)
+```
+
+This detects your system’s hardware and configures:
+
+- **Cache size**: 10% of total RAM (bounded: 256MB — 16GB)
+- **Shard count**: 4–8 shards per CPU core (power of 2, range: 16–256)
+- **Slots per shard**: Calculated for optimal load factor (power of 2, range: 256–65,536)
+
+### Manual Size Configuration
+
+```go
+// Configure for a specific memory target
+cfg := cache.ConfigFromMemorySize(2 * 1024 * 1024 * 1024) // 2GB
+c := cache.NewCloxCache[[]byte, *MyValue](cfg)
+```
+
+### Full Manual Configuration
+
+```go
+cfg := cache.Config{
+NumShards:     64,   // Must be power of 2
+SlotsPerShard: 4096, // Must be power of 2
+CollectStats:  true, // Enable hit/miss/eviction counters
+AdaptiveDecay: false, // Enable adaptive decay tuning
+}
+c := cache.NewCloxCache[string, *MyValue](cfg)
+```
+
+## API Reference
+
+### Creating a Cache
+
+```go
+// From hardware detection
+cfg := cache.ConfigFromHardware()
+
+// From memory target
+cfg := cache.ConfigFromMemorySize(targetBytes uint64)
+
+// Create cache with key type K (string or []byte) and value type V
+c := cache.NewCloxCache[K, V](cfg)
+```
+
+### Operations
+
+```go
+// Store a value (returns false if admission rejected)
+admitted := c.Put(key, value)
+
+// Retrieve a value
+value, found := c.Get(key)
+
+// Get statistics (only meaningful when CollectStats is enabled)
+hits, misses, evictions := c.Stats()
+
+// Clean shutdown (stops background goroutines)
+c.Close()
+```
+
+### Hardware Detection Utilities
+
+```go
+// Get hardware info
+hw := cache.DetectHardware()
+fmt.Printf("CPUs: %d, RAM: %s\n", hw.NumCPU, cache.FormatMemory(hw.TotalMemory))
+
+// Estimate memory for a config
+estimated := cfg.EstimateMemoryUsage()
+fmt.Printf("Estimated memory: %s\n", cache.FormatMemory(estimated))
+```
+
+## Performance Options
+
+### CollectStats
+
+Tracks hit/miss/eviction counters. Adds atomic counter increments on every Get operation.
+
+```go
+cfg := cache.Config{
+NumShards:     64,
+SlotsPerShard: 4096,
+CollectStats:  true,
+}
+```
+
+### AdaptiveDecay
+
+Dynamically adjusts eviction aggressiveness based on hit rate and admission pressure.
+Automatically enables and requires `CollectStats`.
+
+```go
+cfg := cache.Config{
+NumShards:     64,
+SlotsPerShard: 4096,
+AdaptiveDecay: true, // implies CollectStats
 }
 ```
 
 **Behavior:**
 
-- Detects CPU count and system memory
-- Allocates **10% of total RAM** for cache (bounded: 256MB - 16GB)
-- Calculates optimal shard count: **4-8 shards per CPU core**
-- Ensures power-of-2 shard and slot counts for efficient bit-masking
+- Monitors hit rate and admission rejection pressure every second
+- Adjusts decay step (1–4) based on cache pressure
+- Higher pressure + lower hit rate = more aggressive eviction
 
-**Example auto-configuration:**
+### Performance Comparison
 
-- **16 CPU system with 8GB RAM**:
-    - Cache size: ~819MB
-    - Shards: 64 (4 per core)
-    - Slots per shard: 65,536
-    - Total capacity: ~4M records
-
-### 2. Manual Cache Size Configuration
-
-Specify a custom cache size with the `max_cache_size` directive:
-
-```caddyfile
-:443 {
-    atlas {
-          # ... other options ...
-              max_cache_size 2GB
-          }
-}
-```
-
-**Supported formats:**
-
-- Bytes: `536870912` or `512MB` or `1GB`
-- Caddy's `ParseSize()` supports: `KB`, `MB`, `GB`, `TB`
-
-**Example configurations:**
-
-| `max_cache_size` | Shards | Slots/Shard | Total Slots | Estimated Memory |
-|------------------|--------|-------------|-------------|------------------|
-| `256MB`          | 64     | 16,384      | 1,048,576   | ~128MB           |
-| `512MB`          | 64     | 32,768      | 2,097,152   | ~256MB           |
-| `1GB`            | 64     | 65,536      | 4,194,304   | ~512MB           |
-| `2GB`            | 64     | 65,536      | 4,194,304   | ~512MB           |
-| `4GB`            | 64     | 65,536      | 4,194,304   | ~512MB           |
-
-**Note:** The estimated memory is lower than the target because it only accounts for cache structures (nodes, slots).
-Actual record data is stored separately.
-
-## Complete Caddyfile Examples
-
-### Development Environment (Small Cache)
-
-```caddyfile
-:443 {
-    atlas {
-              credentials "dev-api-key"
-              db_path "./data/"
-              socket "./atlas.sock"
-              development_mode true
-              max_cache_size 256MB
-          }
-}
-```
-
-### Production Environment (Auto-detect)
-
-```caddyfile
-:443 {
-    atlas {
-              credentials {$ATLAS_API_KEY}
-              db_path "/var/lib/atlas/"
-              socket "/var/run/atlas.sock"
-              region "us-west-2"
-              advertise "db-node-1.example.com:443"
-
-          # Auto-detect hardware and configure cache
-          # No max_cache_size specified
-          }
-}
-```
-
-### Production Environment (Large Server)
-
-```caddyfile
-:443 {
-    atlas {
-              credentials {$ATLAS_API_KEY}
-              db_path "/var/lib/atlas/"
-              socket "/var/run/atlas.sock"
-              region "us-west-2"
-              advertise "db-node-1.example.com:443"
-              max_cache_size 8GB
-          }
-}
-```
-
-### Multi-Region Cluster
-
-```caddyfile
-:443 {
-    atlas {
-              credentials {$ATLAS_API_KEY}
-              connect "https://bootstrap-node.example.com"
-              db_path "/var/lib/atlas/"
-              region "eu-central-1"
-              advertise "db-node-eu-1.example.com:443"
-              max_cache_size 4GB
-          }
-}
-```
+| Configuration         | Get Latency | Use Case             |
+|-----------------------|-------------|----------------------|
+| Default (both false)  | ~26ns       | Maximum throughput   |
+| `CollectStats: true`  | ~52ns       | Observability needed |
+| `AdaptiveDecay: true` | ~52ns       | Variable workloads   |
 
 ## Configuration Algorithm
 
@@ -135,11 +175,7 @@ numShards = nextPowerOf2(numCPU * 4)
 numShards = clamp(numShards, 16, 256)
 ```
 
-**Rationale:**
-
-- 4-8 shards per core provides good parallelism
-- Power of 2 enables efficient bit-masking for routing
-- Bounds (16-256) prevent extreme configurations
+4–8 shards per core provide good parallelism, while power-of-2 enables efficient bit-masking.
 
 ### Slot Calculation
 
@@ -155,223 +191,72 @@ slotsPerShard = clamp(slotsPerShard, 256, 65536)
 - Average record: 200 bytes
 - Node overhead: 96 bytes
 - Slot overhead: 8 bytes
-- Target load factor: 1.0 (avg chain length ~1)
+- Target load factor: 1.0
 
 ### Memory Estimation
 
 ```
-slotArrayMemory = totalSlots × 8 bytes
-nodeMemory = (totalSlots × 1.25) × 96 bytes
-shardOverhead = numShards × 64 bytes
+slotArrayMemory = totalSlots * 8 bytes
+nodeMemory = (totalSlots * 1.25) * 96 bytes
+shardOverhead = numShards * 64 bytes
 totalMemory = slotArrayMemory + nodeMemory + shardOverhead
 ```
 
-## Monitoring Cache Performance
+## Sizing Recommendations
 
-### Startup Logs
-
-When CloxCache initializes, it logs the configuration:
-
-**Auto-configured:**
-
-```
-📊 CloxCache auto-configured from hardware
-  cpu_count=16
-  total_memory=8.0 GB
-  cache_size=819.2 MB
-  shards=64
-  slots_per_shard=65536
-```
-
-**Manually configured:**
-
-```
-📊 CloxCache configured from max_cache_size
-  size=2.0 GB
-  shards=64
-  slots_per_shard=65536
-```
-
-### Runtime Metrics
-
-Access cache statistics programmatically (requires `CollectStats: true`):
-
-```go
-hits, misses, evictions := stateMachine.Stats()
-hitRate := float64(hits) / float64(hits + misses)
-```
-
-**Note:** Statistics are only collected when `CollectStats` or `AdaptiveDecay` is enabled in the cache configuration.
-When disabled, `Stats()` returns zeros.
+| Use Case          | CPUs  | RAM      | Recommended Config                |
+|-------------------|-------|----------|-----------------------------------|
+| Development       | 2-4   | 4-8GB    | `ConfigFromMemorySize(256MB)`     |
+| Small Production  | 4-8   | 8-16GB   | `ConfigFromMemorySize(512MB-1GB)` |
+| Medium Production | 8-16  | 16-32GB  | `ConfigFromMemorySize(1-2GB)`     |
+| Large Production  | 16-32 | 32-64GB  | `ConfigFromMemorySize(2-4GB)`     |
+| Dedicated Server  | 32-64 | 64-256GB | `ConfigFromMemorySize(4-16GB)`    |
 
 ## Tuning Guidelines
 
-### When to Use Auto-configuration
-
-✅ **Good for:**
-
-- Development environments
-- Standard production servers (4-32 cores, 8-64GB RAM)
-- When you want reasonable defaults without tuning
-
-### When to Manually Configure
-
-✅ **Good for:**
-
-- Dedicated database servers with predictable workloads
-- Large servers (64+ cores, 128GB+ RAM) where 10% may be too much
-- Memory-constrained environments where you need precise control
-- Shared servers where you want to limit atlas-db's memory footprint
-
-### Sizing Recommendations
-
-| Server Type         | CPUs  | RAM      | Recommended `max_cache_size` |
-|---------------------|-------|----------|------------------------------|
-| Development         | 2-4   | 4-8GB    | `256MB`                      |
-| Small Production    | 4-8   | 8-16GB   | `512MB` - `1GB`              |
-| Medium Production   | 8-16  | 16-32GB  | `1GB` - `2GB`                |
-| Large Production    | 16-32 | 32-64GB  | `2GB` - `4GB`                |
-| Dedicated DB Server | 32-64 | 64-256GB | `4GB` - `16GB`               |
-
-### Performance Considerations
-
-**Shard Count:**
+### Shard Count
 
 - More shards = better parallelism on multi-core systems
 - Too many shards = overhead from shard structures
-- Sweet spot: **4-8 shards per CPU core**
+- Sweet spot: 4–8 shards per CPU core
 
-**Load Factor:**
+### Load Factor
 
-- Target: **1.0-1.25** (avg 1 node per slot)
-- Lower load factor = faster lookups, more memory
-- Higher load factor = slower lookups, less memory
+- Target: 1.0-1.25 (avg 1 node per slot)
+- Lower = faster lookups, more memory
+- Higher = slower lookups, less memory
 - CloxCache uses chaining, so load factor > 1.0 is acceptable
 
-**Memory vs. Hit Rate:**
+### Memory vs. Hit Rate
 
-- Larger cache = higher hit rate = fewer log reconstructions
-- Balance cache size with available RAM
-- Monitor eviction rate - high evictions may indicate cache is too small
+- Larger cache = higher hit rate
+- Monitor eviction rate — high evictions may indicate the cache is too small
 
 ## Troubleshooting
 
-### Cache Too Small (High Eviction Rate)
+### High Eviction Rate
 
-**Symptom:** Frequent "cache admission rejected" warnings in logs
+If `Put()` frequently returns `false`, the cache is under pressure. Increase cache size:
 
-**Solution:**
-
-```caddyfile
-max_cache_size 2GB  # Increase from current size
+```go
+cfg := cache.ConfigFromMemorySize(4 * 1024 * 1024 * 1024) // 4GB
 ```
 
 ### Memory Pressure
 
-**Symptom:** System running out of memory, OOM kills
-
-**Solution:**
-
-```caddyfile
-max_cache_size 512MB  # Reduce cache size
-```
-
-### Poor Cache Performance
-
-**Symptom:** High miss rate despite adequate memory
-
-**Possible causes:**
-
-- Working set larger than cache size → increase `max_cache_size`
-- Zipf distribution with many cold keys → cache is working as designed
-- Scans overwhelming cache → implement admission gate tuning (future)
-
-## Performance Options
-
-CloxCache provides two optional features that can be enabled for observability or adaptive behavior at the cost of some
-performance overhead.
-
-### CollectStats
-
-When enabled, tracks hit/miss/eviction counters.
+If system memory is constrained, reduce the cache size:
 
 ```go
-cfg := cache.Config{
-NumShards:     64,
-SlotsPerShard: 4096,
-CollectStats:  true, // Enable statistics collection
-}
+cfg := cache.ConfigFromMemorySize(256 * 1024 * 1024) // 256MB
 ```
 
-**Trade-off:** Adds atomic counter increments on every Get operation. Disable for maximum throughput.
+### Poor Hit Rate
 
-### AdaptiveDecay
+If the hit rate is low despite adequate memory:
 
-When enabled, dynamically adjusts the eviction decay rate based on hit rate and admission pressure. Automatically
-enables `CollectStats`.
+- Working set may be larger than cache — increase size
+- Access pattern may have many cold keys — cache is working as designed
 
-```go
-cfg := cache.Config{
-NumShards:     64,
-SlotsPerShard: 4096,
-AdaptiveDecay: true, // Enable adaptive decay (implies CollectStats)
-}
-```
+## License
 
-**Behavior:**
-
-- Monitors hit rate and admission rejection pressure
-- Adjusts decay step (1-4) every second
-- Higher pressure + lower hit rate → more aggressive eviction
-
-**Trade-off:** Adds a background goroutine and atomic counter overhead. Use when workload patterns vary significantly.
-
-### Performance Comparison
-
-| Configuration         | Get Latency | Use Case             |
-|-----------------------|-------------|----------------------|
-| Default (both false)  | ~26ns       | Maximum throughput   |
-| `CollectStats: true`  | ~52ns       | Observability needed |
-| `AdaptiveDecay: true` | ~52ns       | Variable workloads   |
-
-## Advanced: Programmatic Configuration
-
-For custom integrations, configure CloxCache directly in Go:
-
-```go
-import "github.com/bottledcode/atlas-db/atlas/cache"
-
-// Auto-detect hardware
-cfg := cache.ConfigFromHardware()
-
-// Or specify size
-cfg := cache.ConfigFromMemorySize(2 * 1024 * 1024 * 1024) // 2GB
-
-// Enable optional features
-cfg.CollectStats = true   // Enable hit/miss/eviction tracking
-cfg.AdaptiveDecay = true  // Enable adaptive decay tuning
-
-// Create cache with key type ([]byte or string) and value type
-myCache := cache.NewCloxCache[[]byte, *MyType](cfg)
-
-// Get statistics (only meaningful when CollectStats is enabled)
-hits, misses, evictions := myCache.Stats()
-hitRate := float64(hits) / float64(hits + misses)
-
-// Get configuration info
-hw := cache.DetectHardware()
-fmt.Printf("CPUs: %d, RAM: %s, Cache: %s\n",
-hw.NumCPU,
-cache.FormatMemory(hw.TotalMemory),
-cache.FormatMemory(hw.CacheSize))
-
-// Estimate memory for a config
-estimated := cfg.EstimateMemoryUsage()
-fmt.Printf("Estimated memory: %s\n", cache.FormatMemory(estimated))
-```
-
-## References
-
-- [CloxCache Design Document](../../kv-cache.md)
-- [Caddy Configuration](https://caddyserver.com/docs/caddyfile)
-- [Atlas-DB Options](../options/options.go)
+See [LICENSE](LICENSE) file — MIT License.
