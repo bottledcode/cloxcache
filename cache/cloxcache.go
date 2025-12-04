@@ -23,6 +23,7 @@ const (
 	decayInterval = 1 * time.Second
 )
 
+
 // Key is a type constraint for cache keys (string or []byte)
 type Key interface {
 	~string | ~[]byte
@@ -34,9 +35,6 @@ type CloxCache[K Key, V any] struct {
 	shards    []shard[K, V]
 	numShards int
 	shardBits int
-
-	// CLOCK hand position
-	hand atomic.Uint64
 
 	// Configuration
 	collectStats bool
@@ -60,13 +58,14 @@ type CloxCache[K Key, V any] struct {
 // shard contains a portion of the cache slots with minimal lock contention
 type shard[K Key, V any] struct {
 	slots      []atomic.Pointer[recordNode[K, V]]
-	mu         sync.Mutex   // only for insertions and sweeper unlink
-	entryCount atomic.Int64 // entries in this shard
-	capacity   int64        // max entries for this shard
+	mu         sync.Mutex    // only for insertions and sweeper unlink
+	entryCount atomic.Int64  // live entries in this shard
+	capacity   int64         // max live entries for this shard
+	hand       atomic.Uint64 // per-shard CLOCK hand position
 }
 
 // recordNode is a cache entry with collision chaining
-// Layout optimized for cache-line efficiency
+// Layout optimized for cache-line efficiency (56 bytes with string key, fits in one cache line)
 // Note: For pointer types V, we can use atomic.Pointer. For value types, we use atomic.Value.
 type recordNode[K Key, V any] struct {
 	// Hot fields accessed on every lookup
@@ -218,15 +217,7 @@ func (c *CloxCache[K, V]) Get(key K) (V, bool) {
 				if c.collectStats {
 					c.hits.Add(1)
 				}
-				val := node.value.Load()
-				if val == nil {
-					// Value was nil, treat as miss
-					if c.collectStats {
-						c.misses.Add(1)
-					}
-					return zero, false
-				}
-				return val.(V), true
+				return node.value.Load().(V), true
 			}
 		}
 		node = node.next.Load()
@@ -252,9 +243,8 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 	for node != nil {
 		if node.keyHash == hash {
 			if keysEqual(node.key, key) {
-				// Update existing value atomically
+				// Update existing - bump frequency by 1
 				node.value.Store(value)
-				// Bump frequency
 				for {
 					f := node.freq.Load()
 					if f >= maxFrequency {
@@ -270,8 +260,8 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 		node = node.next.Load()
 	}
 
-	// New key - check admission policy
-	if !c.shouldAdmit() {
+	// New key - check admission policy (per-shard)
+	if !c.shouldAdmit(shard) {
 		if c.collectStats {
 			c.pressure.Add(1)
 		}
@@ -341,7 +331,10 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	if maxScan < 1 {
 		maxScan = 1
 	}
-	startSlot := int(c.hand.Add(uint64(maxScan/2)) % uint64(slotsPerShard))
+	// Advance hand by at least 1 to preserve CLOCK round-robin behavior
+	// Use (maxScan+1)/2 to round up, ensuring advancement even when maxScan==1
+	advance := (maxScan + 1) / 2
+	startSlot := int(shard.hand.Add(uint64(advance)) % uint64(slotsPerShard))
 	evicted := 0
 
 	for scanned := 0; scanned < maxScan; scanned++ {
@@ -357,13 +350,14 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 			f := node.freq.Load()
 
 			if f == 0 {
-				// Evict this node
+				// Entry with freq=0 - evict
 				if c.collectStats {
 					c.evictions.Add(1)
 				}
 				shard.entryCount.Add(-1)
 				evicted++
 
+				// Unlink from chain
 				if prev == nil {
 					slot.Store(next)
 				} else {
@@ -371,7 +365,7 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 				}
 				// Don't update prev, node is removed
 			} else {
-				// Decay frequency
+				// freq > 0 - decay frequency
 				if f > dec {
 					node.freq.Store(f - dec)
 				} else {
@@ -391,34 +385,21 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	return evicted
 }
 
-// shouldAdmit implements TinyLFU-style admission gate
-func (c *CloxCache[K, V]) shouldAdmit() bool {
-	// Simple policy: always admit if under pressure threshold
-	// More sophisticated: probe victim slots
-	totalSlots := uint64(c.numShards * len(c.shards[0].slots))
-	startSlot := c.hand.Load() % totalSlots
-	probes := 0
+// shouldAdmit implements TinyLFU-style admission gate (per-shard)
+func (c *CloxCache[K, V]) shouldAdmit(shard *shard[K, V]) bool {
+	// Probe victim slots within this shard only
+	numSlots := uint64(len(shard.slots))
+	startSlot := shard.hand.Load() % numSlots
 
-	for probes < maxProbes {
-		slotID := (startSlot + uint64(probes)) % totalSlots
-		shardID := slotID % uint64(c.numShards)
-		localSlot := slotID / uint64(c.numShards)
-
-		shard := &c.shards[shardID]
-		if int(localSlot) >= len(shard.slots) {
-			probes++
-			continue
-		}
-
-		slot := &shard.slots[localSlot]
+	for probe := uint64(0); probe < maxProbes; probe++ {
+		slotID := (startSlot + probe) % numSlots
+		slot := &shard.slots[slotID]
 		victim := slot.Load()
 
 		if victim == nil || victim.freq.Load() <= initialFreq {
 			// Found admissible slot/victim
 			return true
 		}
-
-		probes++
 	}
 
 	// All probed victims are hotter - reject
