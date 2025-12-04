@@ -310,13 +310,14 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 	return true
 }
 
-// evictFromShard sweeps a shard and evicts low-frequency entries.
+// evictFromShard sweeps a portion of the shard using CLOCK-hand sampling.
 // Called during Put when shard is over capacity. Caller must hold shard lock.
 // Returns the number of entries evicted.
 //
-// Uses a two-pass approach:
-// 1. First pass: decay all frequencies
-// 2. Second pass: evict entries with freq == 0
+// Uses single-pass CLOCK algorithm:
+// - Starts from current hand position
+// - Scans up to 25% of slots per call
+// - Decays and evicts in a single pass
 func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	shard := &c.shards[shardID]
 	dec := c.decayStep.Load()
@@ -324,30 +325,25 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 		dec = 1
 	}
 
-	// First pass: decay all frequencies
-	for slotID := 0; slotID < slotsPerShard; slotID++ {
-		slot := &shard.slots[slotID]
-		for node := slot.Load(); node != nil; node = node.next.Load() {
-			f := node.freq.Load()
-			if f > dec {
-				node.freq.Store(f - dec)
-			} else if f > 0 {
-				node.freq.Store(0)
-			}
-		}
-	}
-
-	// Second pass: evict entries with freq == 0
+	// Start from CLOCK hand position, only scan a portion of slots
+	startSlot := int(c.hand.Add(uint64(slotsPerShard/8)) % uint64(slotsPerShard))
 	evicted := 0
-	for slotID := 0; slotID < slotsPerShard; slotID++ {
+	maxScan := slotsPerShard / 4 // Only scan 25% of slots max
+
+	for scanned := 0; scanned < maxScan; scanned++ {
+		slotID := (startSlot + scanned) % slotsPerShard
 		slot := &shard.slots[slotID]
+
+		// Combined decay + evict in single pass
 		node := slot.Load()
 		var prev *recordNode[K, V]
 
 		for node != nil {
 			next := node.next.Load()
+			f := node.freq.Load()
 
-			if node.freq.Load() == 0 {
+			if f == 0 {
+				// Evict this node
 				if c.collectStats {
 					c.evictions.Add(1)
 				}
@@ -359,11 +355,16 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 				} else {
 					prev.next.Store(next)
 				}
-				node = next
-				continue
+				// Don't update prev, node is removed
+			} else {
+				// Decay frequency
+				if f > dec {
+					node.freq.Store(f - dec)
+				} else {
+					node.freq.Store(0)
+				}
+				prev = node
 			}
-
-			prev = node
 			node = next
 		}
 
