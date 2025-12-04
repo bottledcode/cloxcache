@@ -40,6 +40,7 @@ type CloxCache[K Key, V any] struct {
 
 	// Configuration
 	collectStats bool
+	sweepPercent int // Percentage of shard to scan during eviction (1-100)
 
 	// Metrics (only updated when collectStats is true)
 	hits      atomic.Uint64
@@ -85,6 +86,7 @@ type Config struct {
 	Capacity      int  // Max entries (0 = use SlotsPerShard * NumShards as default)
 	CollectStats  bool // Enable hit/miss/eviction counters (default: false for performance)
 	AdaptiveDecay bool // Enable adaptive decay tuning (implies CollectStats)
+	SweepPercent  int  // Percentage of shard to scan during eviction (default: 15, range: 1-100)
 }
 
 // NewCloxCache creates a new cache with the given configuration
@@ -108,12 +110,21 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 	// AdaptiveDecay implies CollectStats
 	collectStats := cfg.CollectStats || cfg.AdaptiveDecay
 
+	// Default sweep percentage is 15% (optimal balance of hit rate and throughput)
+	sweepPercent := cfg.SweepPercent
+	if sweepPercent <= 0 {
+		sweepPercent = 15
+	} else if sweepPercent > 100 {
+		sweepPercent = 100
+	}
+
 	c := &CloxCache[K, V]{
 		numShards:    cfg.NumShards,
 		shardBits:    bits.Len(uint(cfg.NumShards - 1)),
 		shards:       make([]shard[K, V], cfg.NumShards),
 		stop:         make(chan struct{}),
 		collectStats: collectStats,
+		sweepPercent: sweepPercent,
 	}
 
 	// Calculate per-shard capacity
@@ -326,9 +337,12 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	}
 
 	// Start from CLOCK hand position, only scan a portion of slots
-	startSlot := int(c.hand.Add(uint64(slotsPerShard/8)) % uint64(slotsPerShard))
+	maxScan := slotsPerShard * c.sweepPercent / 100
+	if maxScan < 1 {
+		maxScan = 1
+	}
+	startSlot := int(c.hand.Add(uint64(maxScan/2)) % uint64(slotsPerShard))
 	evicted := 0
-	maxScan := slotsPerShard / 4 // Only scan 25% of slots max
 
 	for scanned := 0; scanned < maxScan; scanned++ {
 		slotID := (startSlot + scanned) % slotsPerShard
