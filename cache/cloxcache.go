@@ -16,9 +16,18 @@ const (
 	// initialFreq is the starting frequency for new keys
 	initialFreq = 1
 
-	// protectedFreqThreshold - items with freq > this is protected from eviction.
-	// Analysis shows freq>=3 items that will likely return
-	protectedFreqThreshold = 2
+	// defaultProtectedFreqThreshold - items with freq > this are protected from eviction.
+	// Analysis shows freq>=3 items are likely to return
+	defaultProtectedFreqThreshold = 2
+
+	// adaptiveCheckInterval - check graduation rate every N evictions
+	adaptiveCheckInterval = 1000
+
+	// graduationRateLow - if the graduation rate falls below this, lower k
+	graduationRateLow = 0.05
+
+	// graduationRateHigh - if the graduation rate rises above this, raise k
+	graduationRateHigh = 0.10
 )
 
 // Key is a type constraint for cache keys (string or []byte)
@@ -56,6 +65,13 @@ type shard[K Key, V any] struct {
 	capacity   int64         // max live entries for this shard
 	hand       atomic.Uint64 // per-shard CLOCK hand position
 	timestamp  atomic.Uint64 // per-shard timestamp for LRU ordering
+
+	// Adaptive threshold tracking (per-shard, no global contention)
+	k                  atomic.Uint32 // current protection threshold for this shard
+	evictedUnprotected atomic.Uint64 // evicted with freq <= k (unprotected)
+	evictedProtected   atomic.Uint64 // evicted with freq > k (protected, fallback)
+	reachedProtected   atomic.Uint64 // items that reached freq > defaultProtectedFreqThreshold (graduated)
+	lastAdaptCheck     atomic.Uint64 // eviction count at last adaptation check
 }
 
 // recordNode is a cache entry with collision chaining
@@ -124,6 +140,7 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 	for i := range c.shards {
 		c.shards[i].slots = make([]atomic.Pointer[recordNode[K, V]], cfg.SlotsPerShard)
 		c.shards[i].capacity = perShardCapacity
+		c.shards[i].k.Store(defaultProtectedFreqThreshold)
 	}
 
 	return c
@@ -180,6 +197,11 @@ func (c *CloxCache[K, V]) Get(key K) (V, bool) {
 			f := node.freq.Load()
 			if f < maxFrequency {
 				if node.freq.CompareAndSwap(f, f+1) {
+					// Track when items cross into protected status (freq > k)
+					// This happens when freq goes from k to k+1
+					if f == shard.k.Load() {
+						shard.reachedProtected.Add(1)
+					}
 					// Only update timestamp when we successfully bumped freq
 					// This amortises the cost, and hot items skip updates entirely
 					node.lastAccess.Store(shard.timestamp.Add(1))
@@ -283,11 +305,12 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 //
 // Algorithm:
 // - Scans a portion of the shard (sweepPercent)
-// - Finds LRU item among low-frequency items (freq <= protectedFreqThreshold)
+// - Finds LRU item among low-frequency items (freq <= k)
 // - Falls back to any LRU item if no low-freq items are found
-// - No decay - preserves frequency information
+// - Adapts k based on graduation rate
 func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	shard := &c.shards[shardID]
+	k := shard.k.Load()
 
 	// Calculate scan range
 	maxScan := slotsPerShard * c.sweepPercent / 100
@@ -319,8 +342,8 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 			access := node.lastAccess.Load()
 			freq := node.freq.Load()
 
-			// Track LRU among low-freq items (protected threshold)
-			if freq <= protectedFreqThreshold && access < lowFreqAccess {
+			// Track LRU among low-freq items (freq <= k, unprotected)
+			if freq <= k && access < lowFreqAccess {
 				lowFreqVictim = node
 				lowFreqPrev = prev
 				lowFreqSlot = slot
@@ -345,10 +368,12 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	var victimSlot *atomic.Pointer[recordNode[K, V]]
 
 	if lowFreqVictim != nil {
+		shard.evictedUnprotected.Add(1) // evicting low-freq (unprotected) item
 		victim = lowFreqVictim
 		victimPrev = lowFreqPrev
 		victimSlot = lowFreqSlot
 	} else if fallbackVictim != nil {
+		shard.evictedProtected.Add(1) // forced to evict high-freq (protected) item
 		victim = fallbackVictim
 		victimPrev = fallbackPrev
 		victimSlot = fallbackSlot
@@ -372,10 +397,100 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 		victimPrev.next.Store(next)
 	}
 
+	// Periodically adapt k based on graduation rate
+	totalEvictions := shard.evictedUnprotected.Load() + shard.evictedProtected.Load()
+	lastCheck := shard.lastAdaptCheck.Load()
+	if totalEvictions-lastCheck >= adaptiveCheckInterval {
+		if shard.lastAdaptCheck.CompareAndSwap(lastCheck, totalEvictions) {
+			c.adaptThreshold(shard)
+		}
+	}
+
 	return 1
+}
+
+// adaptThreshold adjusts the per-shard k based on graduation rate.
+// Called periodically during eviction.
+func (c *CloxCache[K, V]) adaptThreshold(shard *shard[K, V]) {
+	graduated := shard.reachedProtected.Load()
+	totalEvictions := shard.evictedUnprotected.Load() + shard.evictedProtected.Load()
+
+	if totalEvictions == 0 {
+		return
+	}
+
+	// Graduation rate = items that reached freq=3 / total evictions
+	// This tells us: "what fraction of cache churn involved items that built frequency?"
+	rate := float64(graduated) / float64(totalEvictions)
+	currentK := shard.k.Load()
+
+	if rate < graduationRateLow && currentK > 1 {
+		// Very few items graduating - protection isn't helping
+		// Lower k, but never below 1 (need freq>=2 protection to allow graduation)
+		shard.k.Store(currentK - 1)
+	} else if rate > graduationRateHigh && currentK < maxFrequency-1 {
+		// Many items graduating - protection is working, can raise k
+		// Cap at maxFrequency-1 so there's always room to reach protected status
+		shard.k.Store(currentK + 1)
+	}
+
+	// Decay counters to weight recent behavior (but keep minimum for signal)
+	if graduated > 100 {
+		shard.reachedProtected.Store(graduated / 2)
+	}
+	if totalEvictions > 100 {
+		shard.evictedUnprotected.Store(shard.evictedUnprotected.Load() / 2)
+		shard.evictedProtected.Store(shard.evictedProtected.Load() / 2)
+	}
 }
 
 // Stats return cache statistics
 func (c *CloxCache[K, V]) Stats() (hits, misses, evictions uint64) {
 	return c.hits.Load(), c.misses.Load(), c.evictions.Load()
+}
+
+// AdaptiveStats returns per-shard adaptive threshold statistics
+type AdaptiveStats struct {
+	ShardID            int
+	K                  uint32  // current protection threshold
+	GraduationRate     float64 // fraction of items that reached protected status
+	EvictedUnprotected uint64  // items evicted with freq <= k
+	EvictedProtected   uint64  // items evicted with freq > k (fallback)
+	ReachedProtected   uint64  // items that graduated to protected status
+}
+
+// GetAdaptiveStats returns adaptive threshold stats for all shards
+func (c *CloxCache[K, V]) GetAdaptiveStats() []AdaptiveStats {
+	stats := make([]AdaptiveStats, c.numShards)
+	for i := range c.shards {
+		shard := &c.shards[i]
+		graduated := shard.reachedProtected.Load()
+		evictedU := shard.evictedUnprotected.Load()
+		evictedP := shard.evictedProtected.Load()
+		total := evictedU + evictedP
+
+		var rate float64
+		if total > 0 {
+			rate = float64(graduated) / float64(total)
+		}
+
+		stats[i] = AdaptiveStats{
+			ShardID:            i,
+			K:                  shard.k.Load(),
+			GraduationRate:     rate,
+			EvictedUnprotected: evictedU,
+			EvictedProtected:   evictedP,
+			ReachedProtected:   graduated,
+		}
+	}
+	return stats
+}
+
+// AverageK returns the average protection threshold across all shards
+func (c *CloxCache[K, V]) AverageK() float64 {
+	var sum uint32
+	for i := range c.shards {
+		sum += c.shards[i].k.Load()
+	}
+	return float64(sum) / float64(c.numShards)
 }

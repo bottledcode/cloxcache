@@ -1,32 +1,33 @@
 # CloxCache
 
-A high-performance, concurrent in-memory cache for Go with theoretically grounded eviction.
+A high-performance, concurrent in-memory cache for Go with adaptive frequency-based eviction.
 
-CloxCache uses a **protected-frequency eviction** strategy that achieves 81–99% of Bélády’s optimal hit rate on
-real-world workloads, validated on 10 diverse cache traces.
+CloxCache uses an **adaptive protected-frequency eviction** strategy that automatically tunes itself to your workload,
+achieving competitive hit rates while providing **4-11x better concurrent throughput** than mutex-protected caches.
 
-## Key Insight
+## Key Features
 
-Items accessed 3+ times are likely part of the working set.
-Protecting them from eviction significantly improves hit rates for workloads with temporal locality
-(web, database, API caching).
+- **Adaptive eviction threshold**: Automatically adjusts protection level based on workload characteristics
+- **Lock-free reads**: Reads use only atomic operations, enabling massive read concurrency
+- **Sharded writes**: Minimises write contention across CPU cores
+- **Generic**: Supports `string` or `[]byte` keys with any value type
+
+## How It Works
+
+CloxCache protects frequently accessed items from eviction. The protection threshold (k) adapts automatically:
+
+- **High cache pressure** (small cache relative to the working set): k rises, only protecting the hottest items
+- **Low cache pressure** (large cache): k settles at 2, protecting items accessed 3+ times
 
 ```go
-// The core idea: protect frequently-accessed items
-if item.freq <= 2 {
-// Candidate for eviction (one-shot or uncertain)
+// Items with freq > k are protected from eviction
+// k adapts per-shard based on observed graduation rate
+if item.freq <= k {
+    // Candidate for eviction
 } else {
-// Protected (likely working set)
+    // Protected (likely working set)
 }
 ```
-
-## Features
-
-- **Protected-frequency eviction**: Validated on 10 traces to achieve 81–99% of optimal
-- **Concurrent**: Lock-free reads, sharded writes
-- **Generic**: Supports `string` or `[]byte` keys with any value type
-- **Autoconfigured**: Detects hardware and configures shards/capacity automatically
-- **Low overhead**: O(1) operations with minimal memory overhead
 
 ## Installation
 
@@ -45,15 +46,16 @@ import (
 )
 
 func main() {
-	// Auto-detect hardware and configure cache
-	cfg := cache.ConfigFromHardware()
+	cfg := cache.Config{
+		NumShards:     64,
+		SlotsPerShard: 4096,
+		Capacity:      10000,
+	}
 	c := cache.NewCloxCache[string, *MyData](cfg)
 	defer c.Close()
 
-	// Store a value
 	c.Put("user:123", &MyData{Name: "Alice"})
 
-	// Retrieve a value
 	if data, ok := c.Get("user:123"); ok {
 		fmt.Println(data.Name)
 	}
@@ -66,60 +68,72 @@ type MyData struct {
 
 ## Performance
 
-Tested against Bélády’s optimal algorithm (which knows the future) on real-world traces:
+### Hit Rate
 
-| Workload  | CloxCache | Optimal | Efficiency |
-|-----------|-----------|---------|------------|
-| Zipf-1.2  | 88.95%    | 90.06%  | **98.8%**  |
-| Twitter   | 72.98%    | 77.36%  | **94.3%**  |
-| Zipf-1.01 | 73.26%    | 80.16%  | **91.4%**  |
-| OLTP      | 47.27%    | 58.00%  | **81.5%**  |
+Tested on real-world cache traces at various cache capacities:
 
-### When It Works Best
+| Trace        | Capacity | CloxCache | LRU   | Otter (S3-FIFO) | vs LRU     | vs Otter   |
+|--------------|----------|-----------|-------|-----------------|------------|------------|
+| Twitter17    | 5%       | 67.2%     | 63.8% | 70.7%           | **+3.4%**  | -3.5%      |
+| Twitter17    | 50%      | 88.3%     | 88.1% | 88.2%           | **+0.2%**  | **+0.1%**  |
+| Twitter44    | 10%      | 67.4%     | 66.5% | 70.1%           | **+0.9%**  | -2.7%      |
+| Twitter44    | 50%      | 77.7%     | 77.6% | 77.6%           | **+0.04%** | **+0.08%** |
+| OLTP         | 20%      | 67.2%     | 66.8% | 68.2%           | **+0.4%**  | -0.9%      |
+| OLTP         | 50%      | 72.5%     | 72.9% | 72.7%           | -0.4%      | -0.2%      |
+| CloudPhysics | 50%      | 37.8%     | 36.2% | 37.8%           | **+1.6%**  | **+0.09%** |
+| CloudPhysics | 80%      | 43.0%     | 43.0% | 38.0%           | 0%         | **+5.0%**  |
 
-The protected-frequency strategy excels on workloads with **temporal locality**:
+CloxCache consistently beats LRU on most workloads and becomes competitive with Otter at moderate-to-large cache sizes.
 
-- Web application caches
-- Database query caches
-- API response caches
+### Concurrent Throughput
+
+Where CloxCache really shines - lock-free reads scale linearly with goroutines:
+
+| Goroutines | CloxCache   | SimpleLRU (mutex) | Otter       | CloxCache vs LRU |
+|------------|-------------|-------------------|-------------|------------------|
+| 1          | 14.3M ops/s | 29.9M ops/s       | 9.5M ops/s  | 0.5x             |
+| 4          | 40.0M ops/s | 11.7M ops/s       | 16.7M ops/s | **3.4x**         |
+| 8          | 66.6M ops/s | 9.3M ops/s        | 20.9M ops/s | **7.2x**         |
+| 16         | 85.9M ops/s | 7.5M ops/s        | 18.8M ops/s | **11.4x**        |
+
+*(90% reads, 10% writes workload)*
+
+### When to Use CloxCache
+
+**Best for:**
+- Read-heavy concurrent workloads
+- Web/API response caches
 - Session stores
+- Any workload where reads vastly outnumber the writes
 
-### When to Consider Alternatives
+**Consider alternatives when:**
+- Cache is tiny relative to the working set (<10%)
+- Sequential scan workloads
+- Single-threaded applications (LRU is simpler and faster)
 
-For **scan-resistant workloads** (sequential scans, batch processing), the strategy may underperform. Consider:
+## Adaptive Threshold
 
-- Larger cache sizes
-- A different cache
+CloxCache automatically adapts its protection threshold (k)
+based on the "graduation rate"—what fraction of items survives long enough to become frequently accessed.
+
+| Cache Pressure            | Typical k | Behavior                    |
+|---------------------------|-----------|-----------------------------|
+| Very high (1-5% capacity) | 10-14     | Only protect very hot items |
+| High (10-20% capacity)    | 7-11      | Selective protection        |
+| Medium (30-50% capacity)  | 2-7       | Balanced protection         |
+| Low (60%+ capacity)       | 2         | Standard protection         |
+
+This adaptation happens per-shard with no global coordination, maintaining lock-free read performance.
 
 ## Configuration
 
-### Automatic (Recommended)
-
-```go
-cfg := cache.ConfigFromHardware()
-c := cache.NewCloxCache[string, *MyValue](cfg)
-```
-
-Automatically configures:
-
-- Cache size: 10% of RAM (256MB—16GB)
-- Shards: 4–8 per CPU core (16–256 total)
-- Slots per shard: Based on a target load factor
-
-### Memory Target
-
-```go
-cfg := cache.ConfigFromMemorySize(2 * 1024 * 1024 * 1024) // 2GB
-c := cache.NewCloxCache[[]byte, *MyValue](cfg)
-```
-
-### Manual
-
 ```go
 cfg := cache.Config{
-NumShards:     64,   // Must be power of 2
-SlotsPerShard: 4096, // Must be power of 2
-CollectStats:  true, // Enable hit/miss counters
+    NumShards:     64,    // Must be power of 2, recommend 64-256
+    SlotsPerShard: 4096,  // Must be power of 2
+    Capacity:      10000, // Max entries (distributed across shards)
+    CollectStats:  true,  // Enable hit/miss/eviction counters
+    SweepPercent:  15,    // Percent of shard to scan during eviction (1-100)
 }
 c := cache.NewCloxCache[string, *MyValue](cfg)
 ```
@@ -127,40 +141,24 @@ c := cache.NewCloxCache[string, *MyValue](cfg)
 ## API
 
 ```go
-// Store a value
-c.Put(key, value)
+// Store a value (returns false if eviction failed)
+ok := c.Put(key, value)
 
-// Retrieve a value
+// Retrieve a value (lock-free)
 value, found := c.Get(key)
 
 // Get statistics (requires CollectStats: true)
 hits, misses, evictions := c.Stats()
 
+// Get adaptive threshold stats per shard
+adaptiveStats := c.GetAdaptiveStats()
+
+// Get average k across all shards
+avgK := c.AverageK()
+
 // Clean shutdown
 c.Close()
 ```
-
-## Theoretical Foundation
-
-The eviction strategy is backed by three theorems, validated empirically on 10 traces:
-
-1. **Frequency-Future Correlation**: Higher observed frequency correlates with higher reaccessed probability (confirmed on
-   9/10 traces)
-
-2. **Optimal Threshold**: For Zipf-distributed workloads, k=2 (protect freq>=3) is optimal (confirmed on 5/10 real-world
-   traces)
-
-3. **Hit Rate Bound**: Protection improves hit rate proportional to the reaccessed probability difference (8/10 traces
-   show improvement)
-
-## Sizing Guide
-
-| Use Case          | CPUs  | RAM     | Recommended                       |
-|-------------------|-------|---------|-----------------------------------|
-| Development       | 2-4   | 4-8GB   | `ConfigFromMemorySize(256MB)`     |
-| Small Production  | 4-8   | 8-16GB  | `ConfigFromMemorySize(512MB-1GB)` |
-| Medium Production | 8-16  | 16-32GB | `ConfigFromMemorySize(1-2GB)`     |
-| Large Production  | 16-32 | 32-64GB | `ConfigFromMemorySize(2-4GB)`     |
 
 ## License
 
