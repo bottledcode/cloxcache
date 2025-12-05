@@ -73,7 +73,7 @@ func TestCloxCacheConcurrentAccess(t *testing.T) {
 	cfg := Config{
 		NumShards:     64,
 		SlotsPerShard: 2048,
-		Capacity:      totalKeys, // Ensure capacity for all keys
+		Capacity:      totalKeys * 2, // Extra capacity to prevent eviction during concurrent writes
 	}
 	cache := NewCloxCache[[]byte, int](cfg)
 	defer cache.Close()
@@ -329,33 +329,6 @@ func TestCloxCachePointerTypes(t *testing.T) {
 	}
 }
 
-func TestCloxCacheAdaptiveDecay(t *testing.T) {
-	cfg := Config{
-		NumShards:     8,
-		SlotsPerShard: 32,
-		AdaptiveDecay: true,
-	}
-	cache := NewCloxCache[[]byte, int](cfg)
-	defer cache.Close()
-
-	// Generate high pressure by filling cache and rejecting admissions
-	for i := range 500 {
-		key := fmt.Appendf(nil, "key-%d", i)
-		cache.Put(key, i)
-	}
-
-	// Wait for decay retargeting
-	time.Sleep(1100 * time.Millisecond)
-
-	// Decay step should have increased due to pressure
-	decayStep := cache.decayStep.Load()
-	t.Logf("Decay step after pressure: %d", decayStep)
-
-	// We expect decay step > 1 due to high pressure
-	if decayStep == 0 {
-		t.Error("Decay step should not be 0")
-	}
-}
 
 func TestCloxCacheHashCollisions(t *testing.T) {
 	cfg := Config{

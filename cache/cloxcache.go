@@ -1,12 +1,12 @@
-// Package cache provides a lock-free adaptive in-memory LRU cache implementation.
-// CloxCache combines CLOCK-Pro eviction with TinyLFU admission and adaptive frequency decay.
+// Package cache provides a lock-free adaptive in-memory cache implementation.
+// CloxCache uses protected-freq eviction: items with high frequency are protected,
+// with LRU as a tiebreaker among same-frequency items.
 package cache
 
 import (
 	"math/bits"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 const (
@@ -16,20 +16,17 @@ const (
 	// initialFreq is the starting frequency for new keys
 	initialFreq = 1
 
-	// maxProbes is the maximum number of slots to check during admission
-	maxProbes = 8
-
-	// decayInterval is how often to retarget the decay step
-	decayInterval = 1 * time.Second
+	// protectedFreqThreshold - items with freq > this is protected from eviction.
+	// Analysis shows freq>=3 items that will likely return
+	protectedFreqThreshold = 2
 )
-
 
 // Key is a type constraint for cache keys (string or []byte)
 type Key interface {
 	~string | ~[]byte
 }
 
-// CloxCache is a lock-free adaptive in-memory cache with CLOCK-Pro eviction.
+// CloxCache is a lock-free adaptive in-memory cache.
 // It stores generic keys of type K (string or []byte) and values of type V.
 type CloxCache[K Key, V any] struct {
 	shards    []shard[K, V]
@@ -44,10 +41,6 @@ type CloxCache[K Key, V any] struct {
 	hits      atomic.Uint64
 	misses    atomic.Uint64
 	evictions atomic.Uint64
-	pressure  atomic.Uint64
-
-	// Adaptive decay step (1-4)
-	decayStep atomic.Uint32
 
 	// Lifecycle management
 	stop      chan struct{}
@@ -62,20 +55,17 @@ type shard[K Key, V any] struct {
 	entryCount atomic.Int64  // live entries in this shard
 	capacity   int64         // max live entries for this shard
 	hand       atomic.Uint64 // per-shard CLOCK hand position
+	timestamp  atomic.Uint64 // per-shard timestamp for LRU ordering
 }
 
 // recordNode is a cache entry with collision chaining
-// Layout optimized for cache-line efficiency (56 bytes with string key, fits in one cache line)
-// Note: For pointer types V, we can use atomic.Pointer. For value types, we use atomic.Value.
 type recordNode[K Key, V any] struct {
-	// Hot fields accessed on every lookup
-	value   atomic.Value                     // value stored (generic type, atomic for race-safety)
-	next    atomic.Pointer[recordNode[K, V]] // chain traversal
-	keyHash uint64                           // fast hash comparison
-	freq    atomic.Uint32                    // access frequency (0-15)
-
-	// Key stored as generic type (only compared on hash match)
-	key K
+	value      atomic.Value                     // value stored
+	next       atomic.Pointer[recordNode[K, V]] // chain traversal
+	keyHash    uint64                           // fast hash comparison
+	freq       atomic.Uint32                    // access frequency (0-15)
+	lastAccess atomic.Uint64                    // timestamp for LRU tiebreaking
+	key        K
 }
 
 // Config holds CloxCache configuration
@@ -83,9 +73,9 @@ type Config struct {
 	NumShards     int  // Must be power of 2
 	SlotsPerShard int  // Must be power of 2
 	Capacity      int  // Max entries (0 = use SlotsPerShard * NumShards as default)
-	CollectStats  bool // Enable hit/miss/eviction counters (default: false for performance)
-	AdaptiveDecay bool // Enable adaptive decay tuning (implies CollectStats)
-	SweepPercent  int  // Percentage of shard to scan during eviction (default: 15, range: 1-100)
+	CollectStats  bool // Enable hit/miss/eviction counters
+	// (recommend: 15 for temporal workloads and low latency)
+	SweepPercent int // Percentage of shard to scan during eviction
 }
 
 // NewCloxCache creates a new cache with the given configuration
@@ -106,10 +96,6 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 		panic("SlotsPerShard must be a power of 2")
 	}
 
-	// AdaptiveDecay implies CollectStats
-	collectStats := cfg.CollectStats || cfg.AdaptiveDecay
-
-	// Default sweep percentage is 15% (optimal balance of hit rate and throughput)
 	sweepPercent := cfg.SweepPercent
 	if sweepPercent <= 0 {
 		sweepPercent = 15
@@ -122,11 +108,10 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 		shardBits:    bits.Len(uint(cfg.NumShards - 1)),
 		shards:       make([]shard[K, V], cfg.NumShards),
 		stop:         make(chan struct{}),
-		collectStats: collectStats,
+		collectStats: cfg.CollectStats,
 		sweepPercent: sweepPercent,
 	}
 
-	// Calculate per-shard capacity
 	totalCapacity := cfg.Capacity
 	if totalCapacity <= 0 {
 		totalCapacity = cfg.NumShards * cfg.SlotsPerShard
@@ -136,19 +121,9 @@ func NewCloxCache[K Key, V any](cfg Config) *CloxCache[K, V] {
 		perShardCapacity = 1
 	}
 
-	// Initialize shards
 	for i := range c.shards {
 		c.shards[i].slots = make([]atomic.Pointer[recordNode[K, V]], cfg.SlotsPerShard)
 		c.shards[i].capacity = perShardCapacity
-	}
-
-	// Start with gentle decay
-	c.decayStep.Store(1)
-
-	// Start adaptive decay tuning if enabled
-	if cfg.AdaptiveDecay {
-		c.wg.Add(1)
-		go c.retargetDecayLoop()
 	}
 
 	return c
@@ -197,28 +172,24 @@ func (c *CloxCache[K, V]) Get(key K) (V, bool) {
 	shard := &c.shards[shardID]
 	slot := &shard.slots[slotID]
 
-	// Lock-free chain walk
 	node := slot.Load()
 	for node != nil {
-		if node.keyHash == hash {
-			// Compare full key (only on hash match)
-			if keysEqual(node.key, key) {
-				// Atomic saturating increment (0-15)
-				for {
-					f := node.freq.Load()
-					if f >= maxFrequency {
-						break // already saturated
-					}
-					if node.freq.CompareAndSwap(f, f+1) {
-						break // successfully incremented
-					}
+		if node.keyHash == hash && keysEqual(node.key, key) {
+			// Bump frequency (saturating at 15)
+			// If already at max, skip all updates - the item is clearly hot
+			f := node.freq.Load()
+			if f < maxFrequency {
+				if node.freq.CompareAndSwap(f, f+1) {
+					// Only update timestamp when we successfully bumped freq
+					// This amortises the cost, and hot items skip updates entirely
+					node.lastAccess.Store(shard.timestamp.Add(1))
 				}
-
-				if c.collectStats {
-					c.hits.Add(1)
-				}
-				return node.value.Load().(V), true
 			}
+
+			if c.collectStats {
+				c.hits.Add(1)
+			}
+			return node.value.Load().(V), true
 		}
 		node = node.next.Load()
 	}
@@ -238,13 +209,14 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 	shard := &c.shards[shardID]
 	slot := &shard.slots[slotID]
 
-	// First, try to update existing key (lock-free)
+	// First, try to update the existing key (lock-free)
 	node := slot.Load()
 	for node != nil {
 		if node.keyHash == hash {
 			if keysEqual(node.key, key) {
-				// Update existing - bump frequency by 1
+				// Update existing - bump frequency and update access time
 				node.value.Store(value)
+				node.lastAccess.Store(shard.timestamp.Add(1))
 				for {
 					f := node.freq.Load()
 					if f >= maxFrequency {
@@ -260,33 +232,27 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 		node = node.next.Load()
 	}
 
-	// New key - check admission policy (per-shard)
-	if !c.shouldAdmit(shard) {
-		if c.collectStats {
-			c.pressure.Add(1)
-		}
-		return false
-	}
-
-	// Allocate new node with copied key to prevent caller mutations
+	// Allocate new node with a copied key to prevent caller mutations
 	newNode := &recordNode[K, V]{
 		keyHash: hash,
 		key:     copyKey(key),
 	}
 	newNode.value.Store(value)
 	newNode.freq.Store(initialFreq)
+	newNode.lastAccess.Store(shard.timestamp.Add(1))
 
 	// Try CAS onto head
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	// Re-check for existing key under lock
+	// Re-check for an existing key under lock
 	node = slot.Load()
 	for node != nil {
 		if node.keyHash == hash {
 			if keysEqual(node.key, key) {
-				// Someone else inserted it
+				// Someone else inserted it - update value and access time
 				node.value.Store(value)
+				node.lastAccess.Store(shard.timestamp.Add(1))
 				return true
 			}
 		}
@@ -311,149 +277,105 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 	return true
 }
 
-// evictFromShard sweeps a portion of the shard using CLOCK-hand sampling.
+// evictFromShard uses protected-freq eviction with LRU tiebreaking.
 // Called during Put when shard is over capacity. Caller must hold shard lock.
-// Returns the number of entries evicted.
+// Returns the number of entries evicted (0 or 1).
 //
-// Uses single-pass CLOCK algorithm:
-// - Starts from current hand position
-// - Scans up to 25% of slots per call
-// - Decays and evicts in a single pass
+// Algorithm:
+// - Scans a portion of the shard (sweepPercent)
+// - Finds LRU item among low-frequency items (freq <= protectedFreqThreshold)
+// - Falls back to any LRU item if no low-freq items are found
+// - No decay - preserves frequency information
 func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 	shard := &c.shards[shardID]
-	dec := c.decayStep.Load()
-	if dec == 0 {
-		dec = 1
-	}
 
-	// Start from CLOCK hand position, only scan a portion of slots
+	// Calculate scan range
 	maxScan := slotsPerShard * c.sweepPercent / 100
 	if maxScan < 1 {
 		maxScan = 1
 	}
-	// Advance hand by at least 1 to preserve CLOCK round-robin behavior
-	// Use (maxScan+1)/2 to round up, ensuring advancement even when maxScan==1
+
+	// Advance CLOCK hand
 	advance := (maxScan + 1) / 2
 	startSlot := int(shard.hand.Add(uint64(advance)) % uint64(slotsPerShard))
-	evicted := 0
+
+	// Track the best victims: low-freq preferred, any as fallback
+	var lowFreqVictim, lowFreqPrev *recordNode[K, V]
+	var lowFreqSlot *atomic.Pointer[recordNode[K, V]]
+	lowFreqAccess := uint64(^uint64(0)) // max value
+
+	var fallbackVictim, fallbackPrev *recordNode[K, V]
+	var fallbackSlot *atomic.Pointer[recordNode[K, V]]
+	fallbackAccess := uint64(^uint64(0))
 
 	for scanned := 0; scanned < maxScan; scanned++ {
 		slotID := (startSlot + scanned) % slotsPerShard
 		slot := &shard.slots[slotID]
 
-		// Combined decay + evict in single pass
 		node := slot.Load()
 		var prev *recordNode[K, V]
 
 		for node != nil {
-			next := node.next.Load()
-			f := node.freq.Load()
+			access := node.lastAccess.Load()
+			freq := node.freq.Load()
 
-			if f == 0 {
-				// Entry with freq=0 - evict
-				if c.collectStats {
-					c.evictions.Add(1)
-				}
-				shard.entryCount.Add(-1)
-				evicted++
-
-				// Unlink from chain
-				if prev == nil {
-					slot.Store(next)
-				} else {
-					prev.next.Store(next)
-				}
-				// Don't update prev, node is removed
-			} else {
-				// freq > 0 - decay frequency
-				if f > dec {
-					node.freq.Store(f - dec)
-				} else {
-					node.freq.Store(0)
-				}
-				prev = node
+			// Track LRU among low-freq items (protected threshold)
+			if freq <= protectedFreqThreshold && access < lowFreqAccess {
+				lowFreqVictim = node
+				lowFreqPrev = prev
+				lowFreqSlot = slot
+				lowFreqAccess = access
 			}
-			node = next
-		}
 
-		// Stop early if we've evicted enough
-		if shard.entryCount.Load() < shard.capacity {
-			break
-		}
-	}
+			// Track LRU overall (fallback)
+			if access < fallbackAccess {
+				fallbackVictim = node
+				fallbackPrev = prev
+				fallbackSlot = slot
+				fallbackAccess = access
+			}
 
-	return evicted
-}
-
-// shouldAdmit implements TinyLFU-style admission gate (per-shard)
-func (c *CloxCache[K, V]) shouldAdmit(shard *shard[K, V]) bool {
-	// Probe victim slots within this shard only
-	numSlots := uint64(len(shard.slots))
-	startSlot := shard.hand.Load() % numSlots
-
-	for probe := uint64(0); probe < maxProbes; probe++ {
-		slotID := (startSlot + probe) % numSlots
-		slot := &shard.slots[slotID]
-		victim := slot.Load()
-
-		if victim == nil || victim.freq.Load() <= initialFreq {
-			// Found admissible slot/victim
-			return true
+			prev = node
+			node = node.next.Load()
 		}
 	}
 
-	// All probed victims are hotter - reject
-	return false
-}
+	// Choose a victim: prefer low-freq, protect high-freq items
+	var victim, victimPrev *recordNode[K, V]
+	var victimSlot *atomic.Pointer[recordNode[K, V]]
 
-// retargetDecayLoop periodically adjusts the decay step based on metrics
-func (c *CloxCache[K, V]) retargetDecayLoop() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(decayInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stop:
-			return
-		case <-ticker.C:
-			c.retargetDecay()
-		}
-	}
-}
-
-// retargetDecay adjusts the decay step based on hit rate and pressure
-func (c *CloxCache[K, V]) retargetDecay() {
-	hits := c.hits.Load()
-	misses := c.misses.Load()
-	pressure := c.pressure.Load()
-
-	total := hits + misses
-	if total == 0 {
-		return
+	if lowFreqVictim != nil {
+		victim = lowFreqVictim
+		victimPrev = lowFreqPrev
+		victimSlot = lowFreqSlot
+	} else if fallbackVictim != nil {
+		victim = fallbackVictim
+		victimPrev = fallbackPrev
+		victimSlot = fallbackSlot
 	}
 
-	hitRate := float64(hits) / float64(total)
-
-	// Adaptive decay based on pressure and hit rate
-	switch {
-	case pressure > 2000 && hitRate < 0.60:
-		c.decayStep.Store(4) // aggressive eviction
-	case pressure > 1000 && hitRate < 0.70:
-		c.decayStep.Store(3)
-	case pressure > 200 && hitRate < 0.80:
-		c.decayStep.Store(2)
-	default:
-		c.decayStep.Store(1) // gentle aging
+	if victim == nil {
+		return 0
 	}
 
-	// Reset counters for sliding window
-	c.hits.Store(0)
-	c.misses.Store(0)
-	c.pressure.Store(0)
+	// Evict the victim
+	if c.collectStats {
+		c.evictions.Add(1)
+	}
+	shard.entryCount.Add(-1)
+
+	// Unlink from the chain
+	next := victim.next.Load()
+	if victimPrev == nil {
+		victimSlot.Store(next)
+	} else {
+		victimPrev.next.Store(next)
+	}
+
+	return 1
 }
 
-// Stats returns cache statistics
+// Stats return cache statistics
 func (c *CloxCache[K, V]) Stats() (hits, misses, evictions uint64) {
 	return c.hits.Load(), c.misses.Load(), c.evictions.Load()
 }
