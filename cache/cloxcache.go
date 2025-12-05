@@ -419,8 +419,8 @@ func (c *CloxCache[K, V]) adaptThreshold(shard *shard[K, V]) {
 		return
 	}
 
-	// Graduation rate = items that reached freq=3 / total evictions
-	// This tells us: "what fraction of cache churn involved items that built frequency?"
+	// Graduation rate = items that crossed threshold k / total evictions
+	// This tells us: "what fraction of items survived long enough to become protected?"
 	rate := float64(graduated) / float64(totalEvictions)
 	currentK := shard.k.Load()
 
