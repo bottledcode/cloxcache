@@ -45,7 +45,6 @@ func TestMemoryAllocationDiagnostic(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 1024,
 		CollectStats:  true,
-		AdaptiveDecay: true,
 	}
 
 	keysToInsert := 50000
@@ -94,7 +93,6 @@ func TestMemoryAllocationDiagnostic(t *testing.T) {
 	t.Logf("  Occupied slots: %d (%.1f%%)", occupiedSlotsAfter, float64(occupiedSlotsAfter)*100/float64(totalSlotsCheck))
 	t.Logf("  Avg chain length: %.2f", float64(entriesAfterInsert)/float64(occupiedSlotsAfter))
 	t.Logf("  Evictions so far: %d", evictions)
-	t.Logf("  Pressure (rejected): %d", cache.pressure.Load())
 	t.Logf("  Hits: %d, Misses: %d", hits, misses)
 
 	// With synchronous eviction, entries should already be at capacity
@@ -136,7 +134,6 @@ func BenchmarkMemoryAllocation50K(b *testing.B) {
 		NumShards:     16,
 		SlotsPerShard: 1024, // 16K slots
 		CollectStats:  true,
-		AdaptiveDecay: true,
 	}
 
 	keysToInsert := 50000
@@ -177,7 +174,6 @@ func TestEvictionRateVsInsertionRate(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 1024,
 		CollectStats:  true,
-		AdaptiveDecay: true,
 	}
 
 	cache := NewCloxCache[string, int](cfg)
@@ -206,7 +202,6 @@ func TestEvictionRateVsInsertionRate(t *testing.T) {
 	for _, rate := range insertionRates {
 		// Reset counters
 		cache.evictions.Store(0)
-		cache.pressure.Store(0)
 
 		entriesBefore := cache.countEntries()
 		duration := 2 * time.Second
@@ -235,12 +230,10 @@ func TestEvictionRateVsInsertionRate(t *testing.T) {
 
 		entriesAfter := cache.countEntries()
 		evictions := cache.evictions.Load()
-		pressure := cache.pressure.Load()
 
 		t.Logf("  Rate %d keys/sec:", rate)
 		t.Logf("    Inserted: %d, Rejected: %d", insertedCount, rejectedCount)
 		t.Logf("    Evictions: %d (%.1f/sec)", evictions, float64(evictions)/duration.Seconds())
-		t.Logf("    Pressure: %d", pressure)
 		t.Logf("    Entry growth: %d -> %d (delta: %+d)", entriesBefore, entriesAfter, entriesAfter-entriesBefore)
 	}
 }
@@ -251,7 +244,6 @@ func TestBurstInsertionMemoryGrowth(t *testing.T) {
 		NumShards:     16,
 		SlotsPerShard: 1024,
 		CollectStats:  true,
-		AdaptiveDecay: true,
 	}
 
 	cache := NewCloxCache[string, int](cfg)

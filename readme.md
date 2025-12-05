@@ -1,15 +1,32 @@
 # CloxCache
 
-A high-performance, lock-free, adaptive in-memory LRU cache for Go.
-CloxCache combines CLOCK-Pro eviction with TinyLFU admission and optional adaptive frequency decay.
+A high-performance, concurrent in-memory cache for Go with theoretically grounded eviction.
+
+CloxCache uses a **protected-frequency eviction** strategy that achieves 81–99% of Bélády’s optimal hit rate on
+real-world workloads, validated on 10 diverse cache traces.
+
+## Key Insight
+
+Items accessed 3+ times are likely part of the working set.
+Protecting them from eviction significantly improves hit rates for workloads with temporal locality
+(web, database, API caching).
+
+```go
+// The core idea: protect frequently-accessed items
+if item.freq <= 2 {
+// Candidate for eviction (one-shot or uncertain)
+} else {
+// Protected (likely working set)
+}
+```
 
 ## Features
 
-- **Lock-free reads**: Get operations are fully lock-free for maximum throughput
-- **Generic keys and values**: Supports `string` or `[]byte` keys with any value type
-- **Automatic hardware detection**: Configures itself based on CPU count and available memory
-- **Adaptive eviction**: Optional adaptive decay adjusts eviction aggressiveness based on workload
-- **Low overhead**: Minimal memory overhead with efficient bit-masking for shard routing
+- **Protected-frequency eviction**: Validated on 10 traces to achieve 81–99% of optimal
+- **Concurrent**: Lock-free reads, sharded writes
+- **Generic**: Supports `string` or `[]byte` keys with any value type
+- **Autoconfigured**: Detects hardware and configures shards/capacity automatically
+- **Low overhead**: O(1) operations with minimal memory overhead
 
 ## Installation
 
@@ -47,216 +64,104 @@ type MyData struct {
 }
 ```
 
+## Performance
+
+Tested against Bélády’s optimal algorithm (which knows the future) on real-world traces:
+
+| Workload  | CloxCache | Optimal | Efficiency |
+|-----------|-----------|---------|------------|
+| Zipf-1.2  | 88.95%    | 90.06%  | **98.8%**  |
+| Twitter   | 72.98%    | 77.36%  | **94.3%**  |
+| Zipf-1.01 | 73.26%    | 80.16%  | **91.4%**  |
+| OLTP      | 47.27%    | 58.00%  | **81.5%**  |
+
+### When It Works Best
+
+The protected-frequency strategy excels on workloads with **temporal locality**:
+
+- Web application caches
+- Database query caches
+- API response caches
+- Session stores
+
+### When to Consider Alternatives
+
+For **scan-resistant workloads** (sequential scans, batch processing), the strategy may underperform. Consider:
+
+- Larger cache sizes
+- A different cache
+
 ## Configuration
 
-### Automatic Hardware Detection (Recommended)
+### Automatic (Recommended)
 
 ```go
 cfg := cache.ConfigFromHardware()
 c := cache.NewCloxCache[string, *MyValue](cfg)
 ```
 
-This detects your system’s hardware and configures:
+Automatically configures:
 
-- **Cache size**: 10% of total RAM (bounded: 256MB — 16GB)
-- **Shard count**: 4–8 shards per CPU core (power of 2, range: 16–256)
-- **Slots per shard**: Calculated for optimal load factor (power of 2, range: 256–65,536)
+- Cache size: 10% of RAM (256MB—16GB)
+- Shards: 4–8 per CPU core (16–256 total)
+- Slots per shard: Based on a target load factor
 
-### Manual Size Configuration
+### Memory Target
 
 ```go
-// Configure for a specific memory target
 cfg := cache.ConfigFromMemorySize(2 * 1024 * 1024 * 1024) // 2GB
 c := cache.NewCloxCache[[]byte, *MyValue](cfg)
 ```
 
-### Full Manual Configuration
+### Manual
 
 ```go
 cfg := cache.Config{
 NumShards:     64,   // Must be power of 2
 SlotsPerShard: 4096, // Must be power of 2
-CollectStats:  true, // Enable hit/miss/eviction counters
-AdaptiveDecay: false, // Enable adaptive decay tuning
+CollectStats:  true, // Enable hit/miss counters
 }
 c := cache.NewCloxCache[string, *MyValue](cfg)
 ```
 
-## API Reference
-
-### Creating a Cache
+## API
 
 ```go
-// From hardware detection
-cfg := cache.ConfigFromHardware()
-
-// From memory target
-cfg := cache.ConfigFromMemorySize(targetBytes uint64)
-
-// Create cache with key type K (string or []byte) and value type V
-c := cache.NewCloxCache[K, V](cfg)
-```
-
-### Operations
-
-```go
-// Store a value (returns false if admission rejected)
-admitted := c.Put(key, value)
+// Store a value
+c.Put(key, value)
 
 // Retrieve a value
 value, found := c.Get(key)
 
-// Get statistics (only meaningful when CollectStats is enabled)
+// Get statistics (requires CollectStats: true)
 hits, misses, evictions := c.Stats()
 
-// Clean shutdown (stops background goroutines)
+// Clean shutdown
 c.Close()
 ```
 
-### Hardware Detection Utilities
+## Theoretical Foundation
 
-```go
-// Get hardware info
-hw := cache.DetectHardware()
-fmt.Printf("CPUs: %d, RAM: %s\n", hw.NumCPU, cache.FormatMemory(hw.TotalMemory))
+The eviction strategy is backed by three theorems, validated empirically on 10 traces:
 
-// Estimate memory for a config
-estimated := cfg.EstimateMemoryUsage()
-fmt.Printf("Estimated memory: %s\n", cache.FormatMemory(estimated))
-```
+1. **Frequency-Future Correlation**: Higher observed frequency correlates with higher reaccessed probability (confirmed on
+   9/10 traces)
 
-## Performance Options
+2. **Optimal Threshold**: For Zipf-distributed workloads, k=2 (protect freq>=3) is optimal (confirmed on 5/10 real-world
+   traces)
 
-### CollectStats
+3. **Hit Rate Bound**: Protection improves hit rate proportional to the reaccessed probability difference (8/10 traces
+   show improvement)
 
-Tracks hit/miss/eviction counters. Adds atomic counter increments on every Get operation.
+## Sizing Guide
 
-```go
-cfg := cache.Config{
-NumShards:     64,
-SlotsPerShard: 4096,
-CollectStats:  true,
-}
-```
-
-### AdaptiveDecay
-
-Dynamically adjusts eviction aggressiveness based on hit rate and admission pressure.
-Automatically enables and requires `CollectStats`.
-
-```go
-cfg := cache.Config{
-NumShards:     64,
-SlotsPerShard: 4096,
-AdaptiveDecay: true, // implies CollectStats
-}
-```
-
-**Behavior:**
-
-- Monitors hit rate and admission rejection pressure every second
-- Adjusts decay step (1–4) based on cache pressure
-- Higher pressure + lower hit rate = more aggressive eviction
-
-### Performance Comparison
-
-| Configuration         | Get Latency | Use Case             |
-|-----------------------|-------------|----------------------|
-| Default (both false)  | ~26ns       | Maximum throughput   |
-| `CollectStats: true`  | ~52ns       | Observability needed |
-| `AdaptiveDecay: true` | ~52ns       | Variable workloads   |
-
-## Configuration Algorithm
-
-### Shard Calculation
-
-```
-numShards = nextPowerOf2(numCPU * 4)
-numShards = clamp(numShards, 16, 256)
-```
-
-4–8 shards per core provide good parallelism, while power-of-2 enables efficient bit-masking.
-
-### Slot Calculation
-
-```
-estimatedRecords = cacheSize / (recordSize + nodeSize + slotSize/loadFactor)
-totalSlots = estimatedRecords / targetLoadFactor
-slotsPerShard = nextPowerOf2(totalSlots / numShards)
-slotsPerShard = clamp(slotsPerShard, 256, 65536)
-```
-
-**Assumptions:**
-
-- Average record: 200 bytes
-- Node overhead: 96 bytes
-- Slot overhead: 8 bytes
-- Target load factor: 1.0
-
-### Memory Estimation
-
-```
-slotArrayMemory = totalSlots * 8 bytes
-nodeMemory = (totalSlots * 1.25) * 96 bytes
-shardOverhead = numShards * 64 bytes
-totalMemory = slotArrayMemory + nodeMemory + shardOverhead
-```
-
-## Sizing Recommendations
-
-| Use Case          | CPUs  | RAM      | Recommended Config                |
-|-------------------|-------|----------|-----------------------------------|
-| Development       | 2-4   | 4-8GB    | `ConfigFromMemorySize(256MB)`     |
-| Small Production  | 4-8   | 8-16GB   | `ConfigFromMemorySize(512MB-1GB)` |
-| Medium Production | 8-16  | 16-32GB  | `ConfigFromMemorySize(1-2GB)`     |
-| Large Production  | 16-32 | 32-64GB  | `ConfigFromMemorySize(2-4GB)`     |
-| Dedicated Server  | 32-64 | 64-256GB | `ConfigFromMemorySize(4-16GB)`    |
-
-## Tuning Guidelines
-
-### Shard Count
-
-- More shards = better parallelism on multi-core systems
-- Too many shards = overhead from shard structures
-- Sweet spot: 4–8 shards per CPU core
-
-### Load Factor
-
-- Target: 1.0-1.25 (avg 1 node per slot)
-- Lower = faster lookups, more memory
-- Higher = slower lookups, less memory
-- CloxCache uses chaining, so load factor > 1.0 is acceptable
-
-### Memory vs. Hit Rate
-
-- Larger cache = higher hit rate
-- Monitor eviction rate — high evictions may indicate the cache is too small
-
-## Troubleshooting
-
-### High Eviction Rate
-
-If `Put()` frequently returns `false`, the cache is under pressure. Increase cache size:
-
-```go
-cfg := cache.ConfigFromMemorySize(4 * 1024 * 1024 * 1024) // 4GB
-```
-
-### Memory Pressure
-
-If system memory is constrained, reduce the cache size:
-
-```go
-cfg := cache.ConfigFromMemorySize(256 * 1024 * 1024) // 256MB
-```
-
-### Poor Hit Rate
-
-If the hit rate is low despite adequate memory:
-
-- Working set may be larger than cache — increase size
-- Access pattern may have many cold keys — cache is working as designed
+| Use Case          | CPUs  | RAM     | Recommended                       |
+|-------------------|-------|---------|-----------------------------------|
+| Development       | 2-4   | 4-8GB   | `ConfigFromMemorySize(256MB)`     |
+| Small Production  | 4-8   | 8-16GB  | `ConfigFromMemorySize(512MB-1GB)` |
+| Medium Production | 8-16  | 16-32GB | `ConfigFromMemorySize(1-2GB)`     |
+| Large Production  | 16-32 | 32-64GB | `ConfigFromMemorySize(2-4GB)`     |
 
 ## License
 
-See [LICENSE](LICENSE) file — MIT License.
+MIT License - see [LICENSE](LICENSE)
