@@ -3,7 +3,7 @@
 A high-performance, concurrent in-memory cache for Go with adaptive frequency-based eviction.
 
 CloxCache uses an **adaptive protected-frequency eviction** strategy that automatically tunes itself to your workload,
-achieving competitive hit rates while providing **4-11x better concurrent throughput** than mutex-protected caches.
+achieving competitive hit rates while providing **4-18x better concurrent throughput** than mutex-protected caches.
 
 ## Key Features
 
@@ -142,15 +142,15 @@ CloxCache matches or slightly beats LRU on most workloads and becomes competitiv
 
 ### Concurrent Throughput
 
-Where CloxCache really shines—lock-free reads scale linearly with goroutines:
+Where CloxCache really shines—lock-free reads scale with goroutines:
 
-| Goroutines | CloxCache    | SimpleLRU (mutex) | Otter       | CloxCache vs LRU |
-|------------|--------------|-------------------|-------------|------------------|
-| 1          | 13.3M ops/s  | 23.3M ops/s       | 9.5M ops/s  | 0.6x             |
-| 2          | 24.4M ops/s  | 15.3M ops/s       | 11.3M ops/s | 1.6x             |
-| 4          | 43.8M ops/s  | 12.9M ops/s       | 19.5M ops/s | 3.4x             |
-| 8          | 77.7M ops/s  | 11.4M ops/s       | 22.4M ops/s | 6.8x             |
-| 16         | 95.7M ops/s  | 8.5M ops/s        | 21.1M ops/s | 11.3x            |
+| Goroutines | CloxCache     | SimpleLRU (mutex) | Otter        | CloxCache vs LRU |
+|------------|---------------|-------------------|--------------|------------------|
+| 1          | 13.5M ops/s   | 27.7M ops/s       | 9.6M ops/s   | 0.5x             |
+| 4          | 48.9M ops/s   | 13.0M ops/s       | 18.7M ops/s  | 3.8x             |
+| 16         | 92.2M ops/s   | 8.6M ops/s        | 20.1M ops/s  | 10.8x            |
+| 64         | 87.3M ops/s   | 6.9M ops/s        | 15.3M ops/s  | 12.6x            |
+| 256        | 121.9M ops/s  | 6.6M ops/s        | 11.2M ops/s  | 18.4x            |
 
 *(90% reads, 10% writes workload)*
 
@@ -163,11 +163,15 @@ Where CloxCache really shines—lock-free reads scale linearly with goroutines:
 
     | Goroutines | CloxCache (ops/s) | SimpleLRU (ops/s) | Otter (ops/s) |
     |------------|-------------------|-------------------|---------------|
-    | 1 | 13289867 | 23307248 | 9510357 |
-    | 2 | 24360529 | 15284006 | 11329478 |
-    | 4 | 43795533 | 12873824 | 19459776 |
-    | 8 | 77670392 | 11407027 | 22433634 |
-    | 16 | 95669977 | 8474024 | 21113742 |
+    | 1 | 13497493 | 27684893 | 9567466 |
+    | 2 | 26042023 | 16427166 | 12451738 |
+    | 4 | 48922805 | 12972393 | 18695463 |
+    | 8 | 85776322 | 9562000 | 20096564 |
+    | 16 | 92191270 | 8566552 | 20067403 |
+    | 32 | 96150795 | 7350453 | 17469907 |
+    | 64 | 87257301 | 6908122 | 15322895 |
+    | 128 | 114251867 | 6641447 | 13422356 |
+    | 256 | 121912699 | 6631368 | 11191229 |
 ```
 
 </details>
