@@ -238,6 +238,10 @@ avgK := c.AverageK()
 c.Close()
 ```
 
+## Blog Post
+
+For the full story of how CloxCache was developed and the theory behind it, see [Frequency Thresholds and Sharded Eviction: Building CloxCache](https://withinboredom.info/posts/cloxcache/).
+
 ## License
 
 MIT License - see [LICENSE](LICENSE)
