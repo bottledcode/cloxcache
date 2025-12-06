@@ -70,7 +70,7 @@ type shard[K Key, V any] struct {
 	k                  atomic.Uint32 // current protection threshold for this shard
 	evictedUnprotected atomic.Uint64 // evicted with freq <= k (unprotected)
 	evictedProtected   atomic.Uint64 // evicted with freq > k (protected, fallback)
-	reachedProtected   atomic.Uint64 // items that reached freq > defaultProtectedFreqThreshold (graduated)
+	reachedProtected   atomic.Uint64 // items whose freq crossed the shard's current k (graduated)
 	lastAdaptCheck     atomic.Uint64 // eviction count at last adaptation check
 }
 
@@ -452,11 +452,11 @@ func (c *CloxCache[K, V]) Stats() (hits, misses, evictions uint64) {
 // AdaptiveStats returns per-shard adaptive threshold statistics
 type AdaptiveStats struct {
 	ShardID            int
-	K                  uint32  // current protection threshold
-	GraduationRate     float64 // fraction of items that reached protected status
+	K                  uint32  // current protection threshold for this shard
+	GraduationRate     float64 // fraction of items whose freq crossed the shard's k
 	EvictedUnprotected uint64  // items evicted with freq <= k
 	EvictedProtected   uint64  // items evicted with freq > k (fallback)
-	ReachedProtected   uint64  // items that graduated to protected status
+	ReachedProtected   uint64  // items whose freq crossed the shard's current k
 }
 
 // GetAdaptiveStats returns adaptive threshold stats for all shards
