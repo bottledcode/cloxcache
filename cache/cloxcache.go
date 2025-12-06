@@ -27,7 +27,7 @@ const (
 	graduationRateLow = 0.05
 
 	// graduationRateHigh - if the graduation rate rises above this, raise k
-	graduationRateHigh = 0.10
+	graduationRateHigh = 0.20
 )
 
 // Key is a type constraint for cache keys (string or []byte)
