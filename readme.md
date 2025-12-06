@@ -83,7 +83,7 @@ Tested on real-world cache traces at various cache capacities:
 | CloudPhysics | 50%      | 37.84%    | 36.21% | 37.75%          | +1.63%  | +0.09%   | 2.00  |
 | CloudPhysics | 80%      | 42.95%    | 42.99% | 37.95%          | -0.04%  | +5.00%   | 2.00  |
 
-CloxCache consistently beats LRU on most workloads and becomes competitive with Otter at moderate-to-large cache sizes.
+CloxCache matches or slightly beats LRU on most workloads and becomes competitive with Otter at moderate-to-large cache sizes.
 
 <details>
 <summary>Raw benchmark output</summary>
