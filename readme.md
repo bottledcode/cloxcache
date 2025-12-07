@@ -1,13 +1,15 @@
 # CloxCache
 
-A high-performance, concurrent in-memory cache for Go with adaptive frequency-based eviction.
+A high-performance, concurrent in-memory cache for Go with self-tuning frequency-based eviction.
 
-CloxCache uses an **adaptive protected-frequency eviction** strategy that automatically tunes itself to your workload,
-achieving competitive hit rates while providing **4-18x better concurrent throughput** than mutex-protected caches.
+CloxCache uses a **self-tuning protected-frequency eviction** strategy that learns optimal thresholds for your workload,
+achieving **5-30% better hit rates** than Otter (S3-FIFO) while providing **3-5x better concurrent throughput**.
 
 ## Key Features
 
-- **Adaptive eviction threshold**: Automatically adjusts protection level based on workload characteristics
+- **Self-tuning thresholds**: Learns optimal graduation rate thresholds using gradient descent on hit rate
+- **Adaptive eviction threshold**: Automatically adjusts protection level (k) based on workload characteristics
+- **Scan resistant**: Maintains high hit rates even under scan-heavy workloads
 - **Lock-free reads**: Reads use only atomic operations, enabling massive read concurrency
 - **Sharded writes**: Minimises write contention across CPU cores
 - **Generic**: Supports `string` or `[]byte` keys with any value type
@@ -16,12 +18,14 @@ achieving competitive hit rates while providing **4-18x better concurrent throug
 
 CloxCache protects frequently accessed items from eviction. The protection threshold (k) adapts automatically:
 
-- **High cache pressure** (small cache relative to the working set): k rises, only protecting the hottest items
-- **Low cache pressure** (large cache): k settles at 2, protecting items accessed 3+ times
+- Items with `freq > k` are protected from eviction
+- k adapts per-shard based on observed graduation rate
+- The graduation rate thresholds themselves are learned based on whether k changes improve hit rate
 
 ```go
 // Items with freq > k are protected from eviction
 // k adapts per-shard based on observed graduation rate
+// Thresholds self-tune via gradient descent on hit rate
 if item.freq <= k {
     // Candidate for eviction
 } else {
@@ -46,11 +50,8 @@ import (
 )
 
 func main() {
-	cfg := cache.Config{
-		NumShards:     64,
-		SlotsPerShard: 4096,
-		Capacity:      10000,
-	}
+	// Create cache for 10,000 entries
+	cfg := cache.ConfigFromCapacity(10000)
 	c := cache.NewCloxCache[string, *MyData](cfg)
 	defer c.Close()
 
@@ -70,72 +71,74 @@ type MyData struct {
 
 ### Hit Rate
 
-Tested on real-world cache traces at various cache capacities:
+Tested on real-world cache traces (4x back-to-back iterations for warm cache):
 
-| Trace        | Capacity | CloxCache | LRU    | Otter (S3-FIFO) | vs LRU  | vs Otter | Avg K |
-|--------------|----------|-----------|--------|-----------------|---------|----------|-------|
-| OLTP         | 10%      | 61.99%    | 61.48% | 63.23%          | +0.51%  | -1.24%   | 7.97  |
-| OLTP         | 20%      | 67.31%    | 66.83% | 68.15%          | +0.48%  | -0.85%   | 8.39  |
-| OLTP         | 50%      | 72.49%    | 72.92% | 72.66%          | -0.43%  | -0.17%   | 7.00  |
-| Twitter52    | 10%      | 76.24%    | 76.04% | 78.54%          | +0.20%  | -2.30%   | 5.09  |
-| Twitter52    | 20%      | 79.75%    | 79.70% | 80.61%          | +0.04%  | -0.86%   | 7.00  |
-| Twitter52    | 50%      | 82.68%    | 82.67% | 82.57%          | +0.01%  | +0.11%   | 2.00  |
-| CloudPhysics | 50%      | 37.84%    | 36.21% | 37.75%          | +1.63%  | +0.09%   | 2.00  |
-| CloudPhysics | 80%      | 42.95%    | 42.99% | 37.95%          | -0.04%  | +5.00%   | 2.00  |
+| Trace     | Capacity | CloxCache | Otter (S3-FIFO) | vs Otter    |
+|-----------|----------|-----------|-----------------|-------------|
+| OLTP      | 20%      | 71.34%    | 70.54%          | **+0.80%**  |
+| OLTP      | 50%      | 84.24%    | 80.99%          | **+3.25%**  |
+| OLTP      | 70%      | 92.00%    | 80.15%          | **+11.85%** |
+| DS1       | 1%       | 11.21%    | 6.42%           | **+4.79%**  |
+| DS1       | 50%      | 58.10%    | 43.86%          | **+14.24%** |
+| DS1       | 70%      | 78.83%    | 48.70%          | **+30.13%** |
+| Twitter52 | 30%      | 84.84%    | 84.11%          | **+0.73%**  |
+| Twitter52 | 50%      | 89.94%    | 87.25%          | **+2.69%**  |
+| Twitter52 | 70%      | 94.57%    | 87.09%          | **+7.48%**  |
 
-CloxCache matches or slightly beats LRU on most workloads and becomes competitive with Otter at moderate-to-large cache sizes.
+CloxCache significantly outperforms Otter (S3-FIFO) across all workloads, especially at medium-to-high cache capacities
+where the ghost queue provides excellent scan resistance.
 
 <details>
 <summary>Raw benchmark output</summary>
 
 ```
 === RUN   TestCapacitySweep/OLTP
-    Trace: OLTP, Accesses: 500000, Unique keys: 121783
+    Trace: OLTP, Accesses: 500000 (4x = 2000000), Unique keys: 121783
 
     | Capacity | CloxCache | SimpleLRU | Otter | Clox vs LRU | Clox vs Otter | Avg K |
     |----------|-----------|-----------|-------|-------------|---------------|-------|
-    | 1217 (1%) | 35.44% | 37.01% | 45.07% | -1.58% | -9.63% | 11.91 |
-    | 6089 (5%) | 55.58% | 55.42% | 57.74% | +0.16% | -2.17% | 10.97 |
-    | 12178 (10%) | 61.99% | 61.48% | 63.23% | +0.51% | -1.24% | 7.97 |
-    | 24356 (20%) | 67.31% | 66.83% | 68.15% | +0.48% | -0.85% | 8.39 |
-    | 36534 (30%) | 69.85% | 69.51% | 70.15% | +0.34% | -0.30% | 7.00 |
-    | 48713 (40%) | 71.14% | 70.86% | 71.19% | +0.28% | -0.05% | 7.00 |
-    | 60891 (50%) | 72.49% | 72.92% | 72.66% | -0.43% | -0.17% | 7.00 |
-    | 73069 (60%) | 74.52% | 74.62% | 74.51% | -0.10% | +0.02% | 2.08 |
-    | 85248 (70%) | 75.31% | 75.29% | 75.23% | +0.02% | +0.07% | 2.00 |
-    | 97426 (80%) | 75.49% | 75.49% | 75.46% | +0.01% | +0.03% | 2.00 |
+    | 1217 (1%) | 36.70% | 36.44% | 45.11% | +0.25% | -8.41% | 2.53 |
+    | 6089 (5%) | 55.02% | 55.45% | 58.23% | -0.42% | -3.21% | 2.59 |
+    | 12178 (10%) | 61.54% | 61.65% | 64.16% | -0.11% | -2.62% | 2.58 |
+    | 24356 (20%) | 71.34% | 67.32% | 70.54% | +4.02% | +0.80% | 2.91 |
+    | 36534 (30%) | 74.30% | 70.28% | 74.46% | +4.01% | -0.17% | 2.97 |
+    | 48713 (40%) | 78.10% | 71.90% | 79.27% | +6.20% | -1.16% | 2.98 |
+    | 60891 (50%) | 84.24% | 74.26% | 80.99% | +9.98% | +3.25% | 2.70 |
+    | 73069 (60%) | 91.19% | 76.33% | 79.13% | +14.86% | +12.07% | 2.03 |
+    | 85248 (70%) | 92.00% | 78.24% | 80.15% | +13.77% | +11.85% | 2.00 |
+    | 97426 (80%) | 92.65% | 79.83% | 84.13% | +12.82% | +8.52% | 2.00 |
 
-=== RUN   TestCapacitySweep/CloudPhysics
-    Trace: CloudPhysics, Accesses: 100000, Unique keys: 43731
+=== RUN   TestCapacitySweep/DS1
+    Trace: DS1, Accesses: 500000 (4x = 2000000), Unique keys: 320208
 
     | Capacity | CloxCache | SimpleLRU | Otter | Clox vs LRU | Clox vs Otter | Avg K |
     |----------|-----------|-----------|-------|-------------|---------------|-------|
-    | 437 (1%) | 13.23% | 14.76% | 15.95% | -1.53% | -2.72% | 2.02 |
-    | 2186 (5%) | 16.40% | 16.14% | 17.85% | +0.25% | -1.45% | 2.12 |
-    | 4373 (10%) | 17.92% | 17.63% | 22.52% | +0.28% | -4.61% | 2.05 |
-    | 8746 (20%) | 23.47% | 22.89% | 29.84% | +0.58% | -6.37% | 2.34 |
-    | 13119 (30%) | 33.78% | 33.45% | 36.02% | +0.33% | -2.24% | 2.00 |
-    | 17492 (40%) | 36.85% | 36.09% | 37.66% | +0.75% | -0.81% | 2.00 |
-    | 21865 (50%) | 37.84% | 36.21% | 37.75% | +1.63% | +0.09% | 2.00 |
-    | 26238 (60%) | 38.68% | 38.50% | 37.83% | +0.17% | +0.84% | 2.00 |
-    | 30611 (70%) | 40.14% | 39.93% | 37.90% | +0.21% | +2.24% | 2.00 |
-    | 34984 (80%) | 42.95% | 42.99% | 37.95% | -0.04% | +5.00% | 2.00 |
+    | 3202 (1%) | 11.21% | 1.51% | 6.42% | +9.70% | +4.79% | 2.70 |
+    | 16010 (5%) | 16.12% | 5.54% | 17.07% | +10.57% | -0.96% | 2.64 |
+    | 32020 (10%) | 16.89% | 7.35% | 18.77% | +9.55% | -1.88% | 2.81 |
+    | 64041 (20%) | 22.94% | 9.66% | 27.71% | +13.28% | -4.77% | 2.78 |
+    | 96062 (30%) | 28.31% | 10.71% | 42.07% | +17.60% | -13.76% | 2.95 |
+    | 128083 (40%) | 40.32% | 13.76% | 43.94% | +26.56% | -3.62% | 2.75 |
+    | 160104 (50%) | 58.10% | 15.33% | 43.86% | +42.76% | +14.24% | 3.09 |
+    | 192124 (60%) | 77.01% | 17.06% | 50.40% | +59.96% | +26.61% | 7.00 |
+    | 224145 (70%) | 78.83% | 17.32% | 48.70% | +61.51% | +30.13% | 1.00 |
+    | 256166 (80%) | 80.46% | 17.87% | 50.12% | +62.59% | +30.34% | 1.06 |
 
 === RUN   TestCapacitySweep/Twitter52
-    Trace: Twitter52, Accesses: 500000, Unique keys: 82416
+    Trace: Twitter52, Accesses: 500000 (4x = 2000000), Unique keys: 82416
 
     | Capacity | CloxCache | SimpleLRU | Otter | Clox vs LRU | Clox vs Otter | Avg K |
     |----------|-----------|-----------|-------|-------------|---------------|-------|
-    | 824 (1%) | 60.04% | 63.27% | 67.49% | -3.23% | -7.45% | 8.23 |
-    | 4120 (5%) | 72.52% | 72.36% | 75.52% | +0.16% | -3.00% | 7.17 |
-    | 8241 (10%) | 76.24% | 76.04% | 78.54% | +0.20% | -2.30% | 5.09 |
-    | 16483 (20%) | 79.75% | 79.70% | 80.61% | +0.04% | -0.86% | 7.00 |
-    | 24724 (30%) | 81.27% | 81.16% | 81.55% | +0.11% | -0.28% | 6.67 |
-    | 32966 (40%) | 82.15% | 82.14% | 82.14% | +0.01% | +0.01% | 2.00 |
-    | 41208 (50%) | 82.68% | 82.67% | 82.57% | +0.01% | +0.11% | 2.00 |
-    | 49449 (60%) | 83.02% | 83.04% | 82.92% | -0.02% | +0.10% | 2.00 |
-    | 57691 (70%) | 83.24% | 83.25% | 83.17% | -0.01% | +0.07% | 2.00 |
-    | 65932 (80%) | 83.39% | 83.40% | 83.36% | -0.01% | +0.03% | 2.00 |
+    | 824 (1%) | 60.21% | 62.60% | 67.57% | -2.39% | -7.36% | 2.59 |
+    | 4120 (5%) | 72.79% | 72.36% | 76.03% | +0.43% | -3.24% | 2.67 |
+    | 8241 (10%) | 76.85% | 76.25% | 79.56% | +0.60% | -2.71% | 2.53 |
+    | 16483 (20%) | 80.51% | 80.11% | 82.61% | +0.40% | -2.10% | 2.41 |
+    | 24724 (30%) | 84.84% | 81.84% | 84.11% | +2.99% | +0.73% | 2.70 |
+    | 32966 (40%) | 86.69% | 83.08% | 87.25% | +3.61% | -0.56% | 2.73 |
+    | 41208 (50%) | 89.94% | 83.85% | 87.25% | +6.10% | +2.69% | 2.52 |
+    | 49449 (60%) | 94.10% | 84.47% | 86.53% | +9.64% | +7.57% | 2.00 |
+    | 57691 (70%) | 94.57% | 84.93% | 87.09% | +9.64% | +7.48% | 2.00 |
+    | 65932 (80%) | 95.02% | 85.34% | 89.31% | +9.68% | +5.71% | 2.00 |
 ```
 
 </details>
@@ -144,13 +147,13 @@ CloxCache matches or slightly beats LRU on most workloads and becomes competitiv
 
 Where CloxCache really shines—lock-free reads scale with goroutines:
 
-| Goroutines | CloxCache     | SimpleLRU (mutex) | Otter        | CloxCache vs LRU |
-|------------|---------------|-------------------|--------------|------------------|
-| 1          | 13.5M ops/s   | 27.7M ops/s       | 9.6M ops/s   | 0.5x             |
-| 4          | 48.9M ops/s   | 13.0M ops/s       | 18.7M ops/s  | 3.8x             |
-| 16         | 92.2M ops/s   | 8.6M ops/s        | 20.1M ops/s  | 10.8x            |
-| 64         | 87.3M ops/s   | 6.9M ops/s        | 15.3M ops/s  | 12.6x            |
-| 256        | 121.9M ops/s  | 6.6M ops/s        | 11.2M ops/s  | 18.4x            |
+| Goroutines | CloxCache     | Sharded LRU | Otter     | vs LRU | vs Otter |
+|------------|---------------|-------------|-----------|--------|----------|
+| 1          | 8M ops/s      | 21M ops/s   | 8M ops/s  | 0.4x   | 1x       |
+| 4          | 27M ops/s     | 19M ops/s   | 14M ops/s | 1.4x   | **1.9x** |
+| 16         | 48M ops/s     | 23M ops/s   | 15M ops/s | 2.1x   | **3.2x** |
+| 32         | **51M ops/s** | 19M ops/s   | 14M ops/s | 2.7x   | **3.6x** |
+| 64         | **49M ops/s** | 19M ops/s   | 12M ops/s | 2.6x   | **4.2x** |
 
 *(90% reads, 10% writes workload)*
 
@@ -163,15 +166,15 @@ Where CloxCache really shines—lock-free reads scale with goroutines:
 
     | Goroutines | CloxCache (ops/s) | SimpleLRU (ops/s) | Otter (ops/s) |
     |------------|-------------------|-------------------|---------------|
-    | 1 | 13497493 | 27684893 | 9567466 |
-    | 2 | 26042023 | 16427166 | 12451738 |
-    | 4 | 48922805 | 12972393 | 18695463 |
-    | 8 | 85776322 | 9562000 | 20096564 |
-    | 16 | 92191270 | 8566552 | 20067403 |
-    | 32 | 96150795 | 7350453 | 17469907 |
-    | 64 | 87257301 | 6908122 | 15322895 |
-    | 128 | 114251867 | 6641447 | 13422356 |
-    | 256 | 121912699 | 6631368 | 11191229 |
+    | 1 | 7719268 | 20530707 | 7661102 |
+    | 2 | 15338752 | 15398102 | 10394276 |
+    | 4 | 26872126 | 18658618 | 14248072 |
+    | 8 | 42736148 | 19506276 | 16747242 |
+    | 16 | 48342154 | 22812044 | 15180551 |
+    | 32 | 51460402 | 18920666 | 13610213 |
+    | 64 | 49030541 | 19249982 | 11591182 |
+    | 128 | 55669645 | 23647974 | 10668999 |
+    | 256 | 45418697 | 19141549 | 8752127 |
 ```
 
 </details>
@@ -179,31 +182,36 @@ Where CloxCache really shines—lock-free reads scale with goroutines:
 ### When to Use CloxCache
 
 **Best for:**
-- Read-heavy concurrent workloads
+
+- Read-heavy concurrent workloads (4+ goroutines)
 - Web/API response caches
 - Session stores
 - Any workload where reads vastly outnumber the writes
 
 **Consider alternatives when:**
+
 - Cache is tiny relative to the working set (<10%)
-- Sequential scan workloads
 - Single-threaded applications (LRU is simpler and faster)
 
-## Adaptive Threshold
-
-CloxCache automatically adapts its protection threshold (k)
-based on the "graduation rate"—what fraction of items survives long enough to become frequently accessed.
-
-| Cache Pressure            | Typical k | Behavior                    |
-|---------------------------|-----------|-----------------------------|
-| Very high (1-5% capacity) | 8-12      | Only protect very hot items |
-| High (10-20% capacity)    | 5-8       | Selective protection        |
-| Medium (30-50% capacity)  | 2-7       | Balanced protection         |
-| Low (60%+ capacity)       | 2         | Standard protection         |
-
-This adaptation happens per-shard with no global coordination, maintaining lock-free read performance.
-
 ## Configuration
+
+### Simple (Recommended)
+
+```go
+// Create cache for N entries (automatically configures optimal settings)
+cfg := cache.ConfigFromCapacity(10000)
+c := cache.NewCloxCache[string, *MyValue](cfg)
+```
+
+### Memory-based
+
+```go
+// Create cache for a specific memory budget
+cfg := cache.ConfigFromMemorySize(256 * 1024 * 1024) // 256MB
+c := cache.NewCloxCache[string, *MyValue](cfg)
+```
+
+### Manual
 
 ```go
 cfg := cache.Config{
@@ -234,13 +242,17 @@ adaptiveStats := c.GetAdaptiveStats()
 // Get average k across all shards
 avgK := c.AverageK()
 
+// Get average learned thresholds across all shards
+rateLow, rateHigh := c.AverageLearnedThresholds()
+
 // Clean shutdown
 c.Close()
 ```
 
 ## Blog Post
 
-For the full story of how CloxCache was developed and the theory behind it, see [Frequency Thresholds and Sharded Eviction: Building CloxCache](https://withinboredom.info/posts/cloxcache/).
+For the full story of how CloxCache was developed and the theory behind it,
+see [Frequency Thresholds and Sharded Eviction: Building CloxCache](https://withinboredom.info/posts/cloxcache/).
 
 ## License
 

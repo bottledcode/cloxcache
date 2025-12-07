@@ -5,107 +5,59 @@ import (
 	"runtime"
 )
 
-// HardwareConfig contains detected hardware specifications
-type HardwareConfig struct {
-	NumCPU        int    // Number of logical CPUs
-	TotalMemory   uint64 // Total system memory in bytes
-	CacheSize     uint64 // Recommended cache size in bytes
-	NumShards     int    // Recommended number of shards
-	SlotsPerShard int    // Recommended slots per shard
-}
-
-// DetectHardware detects system hardware and returns recommended configuration
-func DetectHardware() HardwareConfig {
-	numCPU := runtime.NumCPU()
-
-	// Get total memory (best effort, fallback to conservative estimate)
-	totalMemory := getTotalMemory()
-
-	// Default to 10% of total memory for cache, with bounds
-	cacheSize := uint64(float64(totalMemory) * 0.10)
-
-	// Apply bounds: min 256MB, max 16GB
-	const minCacheSize = 256 * 1024 * 1024       // 256 MB
-	const maxCacheSize = 16 * 1024 * 1024 * 1024 // 16 GB
-
-	if cacheSize < minCacheSize {
-		cacheSize = minCacheSize
-	}
-	if cacheSize > maxCacheSize {
-		cacheSize = maxCacheSize
+// ConfigFromCapacity creates a CloxCache config for a specific entry capacity.
+// Automatically configures optimal shard count and slot sizing.
+func ConfigFromCapacity(capacity int) Config {
+	if capacity <= 0 {
+		capacity = 1000 // reasonable default
 	}
 
-	return HardwareConfig{
-		NumCPU:      numCPU,
-		TotalMemory: totalMemory,
-		CacheSize:   cacheSize,
-	}
-}
-
-// ComputeShardConfig calculates optimal shard configuration for a target cache size
-func ComputeShardConfig(cacheSize uint64) (numShards, slotsPerShard int) {
-	// Assumptions from design doc:
-	// - Record overhead: ~200 bytes average
-	// - Node overhead: 96 bytes
-	// - Slot overhead: 8 bytes (pointer)
-	// - Load factor: 1.0-1.25 target
-	// - Target: 50% overhead (1.5x multiplier)
-
-	const bytesPerRecord = 200
-	const bytesPerNode = 96
-	const bytesPerSlot = 8
-	const targetLoadFactor = 1.0
-
-	// Estimate number of records that fit in cache
-	// cacheSize = records * bytesPerRecord + records * bytesPerNode + slots * bytesPerSlot
-	// cacheSize = records * (bytesPerRecord + bytesPerNode) + (records / loadFactor) * bytesPerSlot
-	estimatedRecords := int(float64(cacheSize) / (float64(bytesPerRecord+bytesPerNode) + float64(bytesPerSlot)/targetLoadFactor))
-
-	// Calculate slots needed (with load factor)
-	totalSlots := int(float64(estimatedRecords) / targetLoadFactor)
+	// Total slots = capacity * 3 for optimal performance
+	totalSlots := capacity * 3
 
 	// Determine optimal shard count based on CPU count
 	numCPU := runtime.NumCPU()
 
 	// Heuristic: 4-8 shards per core for good parallelism
-	// Use power of 2 for bit-masking efficiency
-	numShards = min(
-		// Clamp to reasonable range: 16-256 shards
-		max(
-
-			nextPowerOf2(numCPU*4), 16), 256)
+	// Use power of 2 for bit-masking efficiency, clamped to 16-256
+	numShards := nextPowerOf2(numCPU * 4)
+	if numShards < 16 {
+		numShards = 16
+	}
+	if numShards > 256 {
+		numShards = 256
+	}
 
 	// Calculate slots per shard (must be power of 2)
-	slotsPerShard = totalSlots / numShards
-	slotsPerShard = min(
-		// Ensure minimum slot count per shard: 256
-		// Ensure reasonable maximum: 64K slots per shard
-		max(
-
-			nextPowerOf2(slotsPerShard), 256), 65536)
-
-	return numShards, slotsPerShard
-}
-
-// ConfigFromHardware creates a CloxCache config from detected hardware
-func ConfigFromHardware() Config {
-	hw := DetectHardware()
-	numShards, slotsPerShard := ComputeShardConfig(hw.CacheSize)
+	slotsPerShard := totalSlots / numShards
+	slotsPerShard = nextPowerOf2(slotsPerShard)
+	if slotsPerShard < 64 {
+		slotsPerShard = 64
+	}
 
 	return Config{
 		NumShards:     numShards,
 		SlotsPerShard: slotsPerShard,
+		Capacity:      capacity,
 	}
 }
 
-// ConfigFromMemorySize creates a CloxCache config for a specific memory target
+// ConfigFromMemorySize creates a CloxCache config for a specific memory budget.
+// Estimates how many entries fit in the given memory and configures accordingly.
 func ConfigFromMemorySize(targetBytes uint64) Config {
-	numShards, slotsPerShard := ComputeShardConfig(targetBytes)
+	// Estimate bytes per entry:
+	// - Node overhead: ~96 bytes (atomic pointers, freq, timestamp, key hash)
+	// - Average value overhead: ~100 bytes (estimate for typical use)
+	// - Slot overhead: ~8 bytes per slot (atomic pointer)
+	// With 3x slots per capacity, slot overhead per entry ≈ 24 bytes
+	const bytesPerEntry = 220 // 96 + 100 + 24
 
-	return Config{
-		NumShards:     numShards,
-		SlotsPerShard: slotsPerShard,
+	capacity := int(targetBytes / bytesPerEntry)
+	if capacity < 100 {
+		capacity = 100
 	}
+
+	return ConfigFromCapacity(capacity)
 }
 
 // nextPowerOf2 returns the next power of 2 >= n
@@ -164,31 +116,4 @@ func FormatMemory(bytes uint64) string {
 
 	units := []string{"KB", "MB", "GB", "TB"}
 	return fmt.Sprintf("%.1f %s", float64(bytes)/float64(div), units[exp])
-}
-
-// getTotalMemory attempts to get total system memory
-// Falls back to conservative estimate if detection fails
-func getTotalMemory() uint64 {
-	// Try to get memory stats from runtime
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	// On some systems, Sys gives a reasonable upper bound
-	// But it's not total system memory, it's Go's memory from OS
-	// So we use a heuristic: assume we can use 50% of physical memory
-
-	// Conservative fallback: assume 8GB system if we can't determine
-	const fallbackMemory = 8 * 1024 * 1024 * 1024
-
-	// If Sys is reasonable (> 100MB), use it as a hint
-	if m.Sys > 100*1024*1024 {
-		// Estimate total system memory as 10x current Go heap
-		// This is a rough heuristic
-		estimated := m.Sys * 10
-		if estimated < fallbackMemory {
-			return estimated
-		}
-	}
-
-	return fallbackMemory
 }
