@@ -2,116 +2,65 @@ package cache
 
 import (
 	"fmt"
-	"runtime"
 	"testing"
 )
 
-func TestDetectHardware(t *testing.T) {
-	hw := DetectHardware()
-
-	// Verify basic sanity
-	if hw.NumCPU <= 0 {
-		t.Errorf("NumCPU should be positive, got %d", hw.NumCPU)
-	}
-
-	if hw.NumCPU != runtime.NumCPU() {
-		t.Errorf("NumCPU mismatch: got %d, expected %d", hw.NumCPU, runtime.NumCPU())
-	}
-
-	if hw.TotalMemory == 0 {
-		t.Error("TotalMemory should be non-zero")
-	}
-
-	if hw.CacheSize == 0 {
-		t.Error("CacheSize should be non-zero")
-	}
-
-	// Cache size should be reasonable (between 256MB and 16GB)
-	const minCacheSize = 256 * 1024 * 1024
-	const maxCacheSize = 16 * 1024 * 1024 * 1024
-
-	if hw.CacheSize < minCacheSize {
-		t.Errorf("CacheSize too small: %d (min: %d)", hw.CacheSize, minCacheSize)
-	}
-
-	if hw.CacheSize > maxCacheSize {
-		t.Errorf("CacheSize too large: %d (max: %d)", hw.CacheSize, maxCacheSize)
-	}
-
-	t.Logf("Detected hardware: CPUs=%d, TotalMemory=%s, CacheSize=%s",
-		hw.NumCPU, FormatMemory(hw.TotalMemory), FormatMemory(hw.CacheSize))
-}
-
-func TestComputeShardConfig(t *testing.T) {
+func TestConfigFromCapacity(t *testing.T) {
 	tests := []struct {
-		name      string
-		cacheSize uint64
+		capacity  int
 		minShards int
 		maxShards int
 		minSlots  int
-		maxSlots  int
 	}{
-		{
-			name:      "256MB cache",
-			cacheSize: 256 * 1024 * 1024,
-			minShards: 16,
-			maxShards: 256,
-			minSlots:  256,
-			maxSlots:  65536,
-		},
-		{
-			name:      "1GB cache",
-			cacheSize: 1024 * 1024 * 1024,
-			minShards: 16,
-			maxShards: 256,
-			minSlots:  256,
-			maxSlots:  65536,
-		},
-		{
-			name:      "4GB cache",
-			cacheSize: 4 * 1024 * 1024 * 1024,
-			minShards: 16,
-			maxShards: 256,
-			minSlots:  256,
-			maxSlots:  65536,
-		},
-		{
-			name:      "16GB cache",
-			cacheSize: 16 * 1024 * 1024 * 1024,
-			minShards: 16,
-			maxShards: 256,
-			minSlots:  256,
-			maxSlots:  65536,
-		},
+		{capacity: 1000, minShards: 16, maxShards: 256, minSlots: 64},
+		{capacity: 10000, minShards: 16, maxShards: 256, minSlots: 64},
+		{capacity: 100000, minShards: 16, maxShards: 256, minSlots: 64},
+		{capacity: 1000000, minShards: 16, maxShards: 256, minSlots: 64},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			numShards, slotsPerShard := ComputeShardConfig(tt.cacheSize)
+		t.Run(fmt.Sprintf("capacity=%d", tt.capacity), func(t *testing.T) {
+			cfg := ConfigFromCapacity(tt.capacity)
 
-			// Verify power of 2
-			if numShards&(numShards-1) != 0 {
-				t.Errorf("numShards is not power of 2: %d", numShards)
+			// Verify config is valid
+			if cfg.NumShards <= 0 {
+				t.Errorf("Invalid NumShards: %d", cfg.NumShards)
+			}
+			if cfg.SlotsPerShard <= 0 {
+				t.Errorf("Invalid SlotsPerShard: %d", cfg.SlotsPerShard)
+			}
+			if cfg.Capacity != tt.capacity {
+				t.Errorf("Capacity mismatch: got %d, expected %d", cfg.Capacity, tt.capacity)
 			}
 
-			if slotsPerShard&(slotsPerShard-1) != 0 {
-				t.Errorf("slotsPerShard is not power of 2: %d", slotsPerShard)
+			// Verify power of 2
+			if cfg.NumShards&(cfg.NumShards-1) != 0 {
+				t.Errorf("NumShards not power of 2: %d", cfg.NumShards)
+			}
+			if cfg.SlotsPerShard&(cfg.SlotsPerShard-1) != 0 {
+				t.Errorf("SlotsPerShard not power of 2: %d", cfg.SlotsPerShard)
 			}
 
 			// Verify bounds
-			if numShards < tt.minShards || numShards > tt.maxShards {
-				t.Errorf("numShards out of bounds: %d (expected %d-%d)",
-					numShards, tt.minShards, tt.maxShards)
+			if cfg.NumShards < tt.minShards || cfg.NumShards > tt.maxShards {
+				t.Errorf("NumShards out of bounds: %d (expected %d-%d)",
+					cfg.NumShards, tt.minShards, tt.maxShards)
+			}
+			if cfg.SlotsPerShard < tt.minSlots {
+				t.Errorf("SlotsPerShard too small: %d (min: %d)",
+					cfg.SlotsPerShard, tt.minSlots)
 			}
 
-			if slotsPerShard < tt.minSlots || slotsPerShard > tt.maxSlots {
-				t.Errorf("slotsPerShard out of bounds: %d (expected %d-%d)",
-					slotsPerShard, tt.minSlots, tt.maxSlots)
+			// Verify total slots >= capacity * 3 (for ghost support)
+			totalSlots := cfg.NumShards * cfg.SlotsPerShard
+			minTotalSlots := tt.capacity * 3
+			if totalSlots < minTotalSlots {
+				t.Errorf("Total slots too small: %d (min: %d for capacity %d)",
+					totalSlots, minTotalSlots, tt.capacity)
 			}
 
-			totalSlots := numShards * slotsPerShard
-			t.Logf("Cache size: %s → shards=%d, slots/shard=%d, total_slots=%d",
-				FormatMemory(tt.cacheSize), numShards, slotsPerShard, totalSlots)
+			t.Logf("Capacity: %d → shards=%d, slots/shard=%d, total_slots=%d (%.1fx capacity)",
+				tt.capacity, cfg.NumShards, cfg.SlotsPerShard, totalSlots, float64(totalSlots)/float64(tt.capacity))
 		})
 	}
 }
@@ -133,24 +82,25 @@ func TestConfigFromMemorySize(t *testing.T) {
 			if cfg.NumShards <= 0 {
 				t.Errorf("Invalid NumShards: %d", cfg.NumShards)
 			}
-
 			if cfg.SlotsPerShard <= 0 {
 				t.Errorf("Invalid SlotsPerShard: %d", cfg.SlotsPerShard)
+			}
+			if cfg.Capacity <= 0 {
+				t.Errorf("Invalid Capacity: %d", cfg.Capacity)
 			}
 
 			// Verify power of 2
 			if cfg.NumShards&(cfg.NumShards-1) != 0 {
 				t.Errorf("NumShards not power of 2: %d", cfg.NumShards)
 			}
-
 			if cfg.SlotsPerShard&(cfg.SlotsPerShard-1) != 0 {
 				t.Errorf("SlotsPerShard not power of 2: %d", cfg.SlotsPerShard)
 			}
 
 			// Estimate memory usage
 			estimated := cfg.EstimateMemoryUsage()
-			t.Logf("Target: %s → Config: shards=%d, slots=%d → Estimated: %s",
-				FormatMemory(size), cfg.NumShards, cfg.SlotsPerShard, FormatMemory(estimated))
+			t.Logf("Target: %s → Config: shards=%d, slots=%d, capacity=%d → Estimated: %s",
+				FormatMemory(size), cfg.NumShards, cfg.SlotsPerShard, cfg.Capacity, FormatMemory(estimated))
 
 			// Estimated should be reasonably close to target
 			// Allow for overhead, so check it's within 3x
@@ -160,36 +110,6 @@ func TestConfigFromMemorySize(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestConfigFromHardware(t *testing.T) {
-	cfg := ConfigFromHardware()
-
-	// Verify config is valid
-	if cfg.NumShards <= 0 {
-		t.Errorf("Invalid NumShards: %d", cfg.NumShards)
-	}
-
-	if cfg.SlotsPerShard <= 0 {
-		t.Errorf("Invalid SlotsPerShard: %d", cfg.SlotsPerShard)
-	}
-
-	// Verify power of 2
-	if cfg.NumShards&(cfg.NumShards-1) != 0 {
-		t.Errorf("NumShards not power of 2: %d", cfg.NumShards)
-	}
-
-	if cfg.SlotsPerShard&(cfg.SlotsPerShard-1) != 0 {
-		t.Errorf("SlotsPerShard not power of 2: %d", cfg.SlotsPerShard)
-	}
-
-	hw := DetectHardware()
-	estimated := cfg.EstimateMemoryUsage()
-
-	t.Logf("Hardware: CPUs=%d, Memory=%s, CacheSize=%s",
-		hw.NumCPU, FormatMemory(hw.TotalMemory), FormatMemory(hw.CacheSize))
-	t.Logf("Config: shards=%d, slots=%d, estimated=%s",
-		cfg.NumShards, cfg.SlotsPerShard, FormatMemory(estimated))
 }
 
 func TestNextPowerOf2(t *testing.T) {
@@ -260,14 +180,13 @@ func TestFormatMemory(t *testing.T) {
 
 func TestEstimateMemoryUsage(t *testing.T) {
 	configs := []Config{
-		{NumShards: 16, SlotsPerShard: 256},
-		{NumShards: 64, SlotsPerShard: 1024},
-		{NumShards: 128, SlotsPerShard: 4096},
-		{NumShards: 128, SlotsPerShard: 52 * 1024},
+		{NumShards: 16, SlotsPerShard: 256, Capacity: 1000},
+		{NumShards: 64, SlotsPerShard: 1024, Capacity: 10000},
+		{NumShards: 128, SlotsPerShard: 4096, Capacity: 100000},
 	}
 
 	for _, cfg := range configs {
-		t.Run(fmt.Sprintf("shards=%d,slots=%d", cfg.NumShards, cfg.SlotsPerShard), func(t *testing.T) {
+		t.Run(fmt.Sprintf("capacity=%d", cfg.Capacity), func(t *testing.T) {
 			estimated := cfg.EstimateMemoryUsage()
 
 			if estimated == 0 {
@@ -275,34 +194,26 @@ func TestEstimateMemoryUsage(t *testing.T) {
 			}
 
 			totalSlots := cfg.NumShards * cfg.SlotsPerShard
-			t.Logf("Config: %d shards × %d slots = %d total slots → %s estimated",
-				cfg.NumShards, cfg.SlotsPerShard, totalSlots, FormatMemory(estimated))
+			t.Logf("Config: %d shards × %d slots = %d total slots, capacity=%d → %s estimated",
+				cfg.NumShards, cfg.SlotsPerShard, totalSlots, cfg.Capacity, FormatMemory(estimated))
 		})
 	}
 }
 
-func BenchmarkDetectHardware(b *testing.B) {
+func BenchmarkConfigFromCapacity(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		_ = DetectHardware()
+		_ = ConfigFromCapacity(100000)
 	}
 }
 
-func BenchmarkComputeShardConfig(b *testing.B) {
-	const cacheSize = 1024 * 1024 * 1024 // 1GB
+func BenchmarkConfigFromMemorySize(b *testing.B) {
+	const memorySize = 1024 * 1024 * 1024 // 1GB
 
 	b.ReportAllocs()
 
 	for b.Loop() {
-		_, _ = ComputeShardConfig(cacheSize)
-	}
-}
-
-func BenchmarkConfigFromHardware(b *testing.B) {
-	b.ReportAllocs()
-
-	for b.Loop() {
-		_ = ConfigFromHardware()
+		_ = ConfigFromMemorySize(memorySize)
 	}
 }
