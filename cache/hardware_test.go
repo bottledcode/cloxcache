@@ -12,10 +12,10 @@ func TestConfigFromCapacity(t *testing.T) {
 		maxShards int
 		minSlots  int
 	}{
-		{capacity: 1000, minShards: 16, maxShards: 256, minSlots: 64},
-		{capacity: 10000, minShards: 16, maxShards: 256, minSlots: 64},
-		{capacity: 100000, minShards: 16, maxShards: 256, minSlots: 64},
-		{capacity: 1000000, minShards: 16, maxShards: 256, minSlots: 64},
+		{capacity: 1000, minShards: 16, maxShards: 8192, minSlots: 64},
+		{capacity: 10000, minShards: 16, maxShards: 8192, minSlots: 64},
+		{capacity: 100000, minShards: 16, maxShards: 8192, minSlots: 64},
+		{capacity: 1000000, minShards: 16, maxShards: 8192, minSlots: 64},
 	}
 
 	for _, tt := range tests {
