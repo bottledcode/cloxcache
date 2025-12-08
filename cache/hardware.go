@@ -15,17 +15,31 @@ func ConfigFromCapacity(capacity int) Config {
 	// Total slots = capacity * 3 for optimal performance
 	totalSlots := capacity * 3
 
-	// Determine optimal shard count based on CPU count
+	// Determine optimal shard count based on both CPU count AND capacity
 	numCPU := runtime.NumCPU()
 
-	// Heuristic: 4-8 shards per core for good parallelism
-	// Use power of 2 for bit-masking efficiency, clamped to 16-256
-	numShards := nextPowerOf2(numCPU * 4)
+	// Base shards on CPU count (4 shards per core for parallelism)
+	shardsFromCPU := numCPU * 4
+
+	// Also scale shards based on capacity to keep chains short
+	// Target: ~1000 items per shard max for fast eviction scans
+	shardsFromCapacity := capacity / 1000
+
+	// Use the larger of the two
+	numShards := shardsFromCPU
+	if shardsFromCapacity > numShards {
+		numShards = shardsFromCapacity
+	}
+
+	// Round up to power of 2 for bit-masking efficiency
+	numShards = nextPowerOf2(numShards)
+
+	// Clamp to reasonable bounds (16 min, 8192 max)
 	if numShards < 16 {
 		numShards = 16
 	}
-	if numShards > 256 {
-		numShards = 256
+	if numShards > 8192 {
+		numShards = 8192
 	}
 
 	// Calculate slots per shard (must be power of 2)
