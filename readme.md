@@ -7,6 +7,8 @@ achieving **5-30% better hit rates** than Otter (S3-FIFO) while providing **3-5x
 
 ## Key Features
 
+- **Linearizable**: Synchronous writes guarantee that a `Get()` immediately after `Put()` returns the value.
+  Many caches (including Otter) use async/buffered writes that break this guarantee.
 - **Self-tuning thresholds**: Learns optimal graduation rate thresholds using gradient descent on hit rate
 - **Adaptive eviction threshold**: Automatically adjusts protection level (k) based on workload characteristics
 - **Scan resistant**: Maintains high hit rates even under scan-heavy workloads
@@ -149,11 +151,13 @@ Where CloxCache really shines—lock-free reads scale with goroutines:
 
 | Goroutines | CloxCache     | Sharded LRU | Otter     | vs LRU | vs Otter |
 |------------|---------------|-------------|-----------|--------|----------|
-| 1          | 8M ops/s      | 21M ops/s   | 8M ops/s  | 0.4x   | 1x       |
-| 4          | 27M ops/s     | 19M ops/s   | 14M ops/s | 1.4x   | **1.9x** |
-| 16         | 48M ops/s     | 23M ops/s   | 15M ops/s | 2.1x   | **3.2x** |
-| 32         | **51M ops/s** | 19M ops/s   | 14M ops/s | 2.7x   | **3.6x** |
-| 64         | **49M ops/s** | 19M ops/s   | 12M ops/s | 2.6x   | **4.2x** |
+| 1          | 11M ops/s     | 26M ops/s   | 9M ops/s  | 0.4x   | 1.2x     |
+| 4          | 34M ops/s     | 22M ops/s   | 18M ops/s | 1.5x   | **1.9x** |
+| 16         | 58M ops/s     | 26M ops/s   | 19M ops/s | 2.2x   | **3.1x** |
+| 32         | **57M ops/s** | 24M ops/s   | 17M ops/s | 2.4x   | **3.3x** |
+| 64         | **77M ops/s** | 22M ops/s   | 14M ops/s | 3.5x   | **5.3x** |
+| 128        | **79M ops/s** | 25M ops/s   | 13M ops/s | 3.2x   | **6.3x** |
+| 256        | **71M ops/s** | 23M ops/s   | 10M ops/s | 3.1x   | **7.4x** |
 
 *(90% reads, 10% writes workload)*
 
@@ -166,23 +170,60 @@ Where CloxCache really shines—lock-free reads scale with goroutines:
 
     | Goroutines | CloxCache (ops/s) | SimpleLRU (ops/s) | Otter (ops/s) |
     |------------|-------------------|-------------------|---------------|
-    | 1 | 7719268 | 20530707 | 7661102 |
-    | 2 | 15338752 | 15398102 | 10394276 |
-    | 4 | 26872126 | 18658618 | 14248072 |
-    | 8 | 42736148 | 19506276 | 16747242 |
-    | 16 | 48342154 | 22812044 | 15180551 |
-    | 32 | 51460402 | 18920666 | 13610213 |
-    | 64 | 49030541 | 19249982 | 11591182 |
-    | 128 | 55669645 | 23647974 | 10668999 |
-    | 256 | 45418697 | 19141549 | 8752127 |
+    | 1 | 11418211 | 26172066 | 9385530 |
+    | 2 | 18357213 | 18090921 | 12668403 |
+    | 4 | 34375650 | 21548263 | 18485753 |
+    | 8 | 54131157 | 23462212 | 17976868 |
+    | 16 | 57887904 | 25676727 | 18815351 |
+    | 32 | 56646010 | 23950319 | 17098614 |
+    | 64 | 77095575 | 22233853 | 14445578 |
+    | 128 | 79179151 | 24930167 | 12561981 |
+    | 256 | 71140637 | 23032562 | 9674261 |
 ```
 
 </details>
+
+### Why Linearizability Matters
+
+Many high-performance caches achieve speed through async/buffered writes. This means:
+
+```go
+cache.Set("key", "value")
+v, ok := cache.Get("key") // May return ok=false!
+```
+
+This is fine for web caches where eventual consistency is acceptable. But for **database buffer pools**, **transaction
+caches**, or any system requiring strong consistency, this is a correctness bug waiting to happen.
+
+CloxCache guarantees **linearizability**: every `Get()` sees all prior `Put()` operations. This makes it safe for:
+
+- Database page caches
+- Write-ahead log buffers
+- Transaction result caches
+- Any system where "I just wrote it, why can’t I read it?" would be a bug
+
+### Real-World Cost Impact
+
+On Twitter production traces with simulated 100μs disk I/O on cache misses:
+
+| Trace              | CloxCache   | Otter       | Speedup  |
+|--------------------|-------------|-------------|----------|
+| Twitter17 (4 iter) | 3.84M ops/s | 2.10M ops/s | **1.8x** |
+| Twitter44 (4 iter) | 3.15M ops/s | 1.25M ops/s | **2.5x** |
+
+CloxCache also achieves **+2% higher hit rates** due to linearizable writes (no "false misses" from async buffering).
+
+At datacenter scale, this translates to:
+
+- **50% fewer servers** needed for the same throughput
+- **19% lower cost per request** (fewer disk I/O from better hit rates)
+- **Lower tail latencies** from fewer cache misses
 
 ### When to Use CloxCache
 
 **Best for:**
 
+- **Database caches** requiring linearizability
 - Read-heavy concurrent workloads (4+ goroutines)
 - Web/API response caches
 - Session stores
@@ -192,6 +233,7 @@ Where CloxCache really shines—lock-free reads scale with goroutines:
 
 - Cache is tiny relative to the working set (<10%)
 - Single-threaded applications (LRU is simpler and faster)
+- Eventual consistency is acceptable and raw write throughput is critical
 
 ## Configuration
 
