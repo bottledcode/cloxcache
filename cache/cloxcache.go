@@ -297,8 +297,9 @@ func (c *CloxCache[K, V]) Put(key K, value V) bool {
 				node.value.Store(value)
 				node.lastAccess.Store(shard.timestamp.Add(1))
 				for {
-					f := node.freq.Load()
-					if f >= maxFrequency {
+					f = node.freq.Load()
+					if f >= maxFrequency || f < 1 {
+						// already at max-freq or became a ghost while we were putting
 						break
 					}
 					if node.freq.CompareAndSwap(f, f+1) {
@@ -498,6 +499,8 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 
 	if canGhost {
 		// Convert to ghost: negate freq, keep in chain
+		// we explicitly don't change the value
+		// this results in a "memory leak" but prevents a race condition since a GET may be currently reading this.
 		victim.freq.Store(-victimFreq)
 		shard.entryCount.Add(-1)
 		shard.ghostCount.Add(1)
