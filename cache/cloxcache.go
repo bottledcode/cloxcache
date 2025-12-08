@@ -495,15 +495,19 @@ func (c *CloxCache[K, V]) evictFromShard(shardID, slotsPerShard int) int {
 		canGhost = true
 	}
 
-	victimFreq := victim.freq.Load()
-
 	if canGhost {
-		// Convert to ghost: negate freq, keep in chain
-		// we explicitly don't change the value
-		// this results in a "memory leak" but prevents a race condition since a GET may be currently reading this.
-		victim.freq.Store(-victimFreq)
-		shard.entryCount.Add(-1)
-		shard.ghostCount.Add(1)
+		// Convert to ghost: atomically negate freq to claim victim and preserve frequency.
+		// CAS ensures we capture the correct freq even if concurrent Gets bump it.
+		// We explicitly don't clear the value: this prevents a race with concurrent Gets.
+		for {
+			f := victim.freq.Load()
+			if victim.freq.CompareAndSwap(f, -f) {
+				shard.entryCount.Add(-1)
+				shard.ghostCount.Add(1)
+				break
+			}
+			// CAS failed - freq was bumped by concurrent access, retry with fresh value
+		}
 	} else {
 		// Fully evict: unlink from chain
 		if c.collectStats {
