@@ -213,10 +213,10 @@ On Twitter production traces with simulated 100μs disk I/O on cache misses:
 
 CloxCache also achieves **+2% higher hit rates** due to linearizable writes (no "false misses" from async buffering).
 
-At datacenter scale, this translates to:
+At datacenter scale, this can translate to (rough estimates):
 
-- **50% fewer servers** needed for the same throughput
-- **19% lower cost per request** (fewer disk I/O from better hit rates)
+- **~50% fewer servers** needed for the same throughput
+- **~20% lower cost per request** (fewer disk I/O from better hit rates)
 - **Lower tail latencies** from fewer cache misses
 
 ### When to Use CloxCache
